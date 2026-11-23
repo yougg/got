@@ -1,0 +1,781 @@
+package main_test
+
+import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+// probeToolSource 是一个测试用工具源码，能够打印自身版本、当前目录、环境变量、参数，
+// 并支持按参数写入相对路径文件或以指定退出码退出。
+const probeToolSourceV1 = `package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+type report struct {
+	Version   string   ` + "`json:\"version\"`" + `
+	Cwd       string   ` + "`json:\"cwd\"`" + `
+	EnvGoWork string   ` + "`json:\"env_gowork\"`" + `
+	GoEnvWork string   ` + "`json:\"go_env_gowork\"`" + `
+	EnvGoOS   string   ` + "`json:\"env_goos\"`" + `
+	EnvGoArch string   ` + "`json:\"env_goarch\"`" + `
+	GoFlags   string   ` + "`json:\"goflags\"`" + `
+	Path      string   ` + "`json:\"path\"`" + `
+	Args      []string ` + "`json:\"args\"`" + `
+}
+
+func main() {
+	writeFile := flag.String("write", "", "write marker file to relative path")
+	exitCode := flag.Int("exit", 0, "exit with specified code")
+	flag.Parse()
+
+	if *exitCode != 0 {
+		os.Exit(*exitCode)
+	}
+
+	cwd, _ := os.Getwd()
+	if *writeFile != "" {
+		content := fmt.Sprintf("generated-by=v1.0.0\ncwd=%s\n", cwd)
+		if err := os.WriteFile(*writeFile, []byte(content), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	out, _ := exec.Command("go", "env", "GOWORK").Output()
+	rep := report{
+		Version:   "v1.0.0",
+		Cwd:       cwd,
+		EnvGoWork: os.Getenv("GOWORK"),
+		GoEnvWork: strings.TrimSpace(string(out)),
+		EnvGoOS:   os.Getenv("GOOS"),
+		EnvGoArch: os.Getenv("GOARCH"),
+		GoFlags:   os.Getenv("GOFLAGS"),
+		Path:      os.Getenv("PATH"),
+		Args:      flag.Args(),
+	}
+	data, _ := json.Marshal(rep)
+	fmt.Println(string(data))
+}
+`
+
+const probeToolSourceV11 = `package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("version=v1.1.0")
+}
+`
+
+const simpleToolSourceTemplate = `package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(%q)
+}
+`
+
+type probeReport struct {
+	Version   string   `json:"version"`
+	Cwd       string   `json:"cwd"`
+	EnvGoWork string   `json:"env_gowork"`
+	GoEnvWork string   `json:"go_env_gowork"`
+	EnvGoOS   string   `json:"env_goos"`
+	EnvGoArch string   `json:"env_goarch"`
+	GoFlags   string   `json:"goflags"`
+	Path      string   `json:"path"`
+	Args      []string `json:"args"`
+}
+
+type testHarness struct {
+	gotBin     string
+	proxyURL   string
+	goModCache string
+	goCache    string
+}
+
+func newTestHarness(t *testing.T) *testHarness {
+	t.Helper()
+
+	binDir := t.TempDir()
+	gotBin := filepath.Join(binDir, "got")
+	buildCmd := exec.Command("go", "build", "-o", gotBin, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build got binary failed: %v\n%s", err, string(out))
+	}
+
+	proxyDir := t.TempDir()
+	publishFakeModule(t, proxyDir, "example.com/probe", "v1.0.0", map[string]string{
+		"go.mod":                "module example.com/probe\n\ngo 1.24\n",
+		"cmd/probetool/main.go": probeToolSourceV1,
+	})
+	publishFakeModule(t, proxyDir, "example.com/probe", "v1.1.0", map[string]string{
+		"go.mod":                "module example.com/probe\n\ngo 1.24\n",
+		"cmd/probetool/main.go": probeToolSourceV11,
+	})
+	publishFakeModule(t, proxyDir, "example.com/conflict", "v1.0.0", map[string]string{
+		"go.mod":            "module example.com/conflict\n\ngo 1.24\n",
+		"a/cmd/dup/main.go": fmt.Sprintf(simpleToolSourceTemplate, "from-a"),
+		"b/cmd/dup/main.go": fmt.Sprintf(simpleToolSourceTemplate, "from-b"),
+	})
+
+	// 复用宿主 GOCACHE 以加快集成测试编译速度，但隔离 GOMODCACHE 以防污染宿主机模块缓存
+	goCacheBytes, err := exec.Command("go", "env", "GOCACHE").Output()
+	if err != nil {
+		t.Fatalf("go env GOCACHE: %v", err)
+	}
+
+	goModCache := t.TempDir()
+	// Go 模块缓存默认将解压目录设为只读 (0555)，在 TempDir 清理前恢复写权限
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(goModCache, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				_ = os.Chmod(p, 0o755)
+			}
+			return nil
+		})
+	})
+
+	return &testHarness{
+		gotBin:     gotBin,
+		proxyURL:   "file://" + filepath.ToSlash(proxyDir),
+		goModCache: goModCache,
+		goCache:    strings.TrimSpace(string(goCacheBytes)),
+	}
+}
+
+func (h *testHarness) runGot(t *testing.T, dir string, extraEnv []string, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+
+	cmd := exec.Command(h.gotBin, args...)
+	cmd.Dir = dir
+
+	baseEnv := make([]string, 0, len(os.Environ())+len(extraEnv)+4)
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		switch key {
+		case "GOPROXY", "GOSUMDB", "GOMODCACHE", "GOCACHE", "GOWORK", "GOFLAGS", "GOTFILE", "GOOS", "GOARCH":
+			continue
+		default:
+			baseEnv = append(baseEnv, kv)
+		}
+	}
+	baseEnv = append(baseEnv,
+		"GOPROXY="+h.proxyURL,
+		"GOSUMDB=off",
+		"GOMODCACHE="+h.goModCache,
+		"GOCACHE="+h.goCache,
+	)
+	baseEnv = append(baseEnv, extraEnv...)
+	cmd.Env = baseEnv
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	if err != nil {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+			return outBuf.String(), errBuf.String(), exitErr.ExitCode()
+		}
+		t.Fatalf("exec got %v failed: %v", args, err)
+	}
+	return outBuf.String(), errBuf.String(), 0
+}
+
+func publishFakeModule(t *testing.T, proxyDir, modPath, version string, files map[string]string) {
+	t.Helper()
+
+	vDir := filepath.Join(proxyDir, filepath.FromSlash(modPath), "@v")
+	if err := os.MkdirAll(vDir, 0o755); err != nil {
+		t.Fatalf("mkdir proxy dir: %v", err)
+	}
+
+	// 追加版本到 @v/list
+	listPath := filepath.Join(vDir, "list")
+	var existing string
+	if data, err := os.ReadFile(listPath); err == nil {
+		existing = string(data)
+	}
+	if err := os.WriteFile(listPath, []byte(existing+version+"\n"), 0o644); err != nil {
+		t.Fatalf("write list: %v", err)
+	}
+
+	infoContent := fmt.Sprintf(`{"Version":%q,"Time":"2026-01-01T00:00:00Z"}`, version)
+	if err := os.WriteFile(filepath.Join(vDir, version+".info"), []byte(infoContent), 0o644); err != nil {
+		t.Fatalf("write info: %v", err)
+	}
+
+	goModContent, ok := files["go.mod"]
+	if !ok {
+		t.Fatalf("module %s@%s missing go.mod", modPath, version)
+	}
+	if err := os.WriteFile(filepath.Join(vDir, version+".mod"), []byte(goModContent), 0o644); err != nil {
+		t.Fatalf("write mod: %v", err)
+	}
+
+	zipPath := filepath.Join(vDir, version+".zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatalf("create zip: %v", err)
+	}
+	zw := zip.NewWriter(f)
+	prefix := modPath + "@" + version + "/"
+	for name, content := range files {
+		w, err := zw.Create(prefix + name)
+		if err != nil {
+			t.Fatalf("zip create %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("zip write %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("file close: %v", err)
+	}
+}
+
+// 场景 1：标准单模块项目全流程（init / get -tool / list / tool -n / tool / get -u / rm）及主项目 go.mod 零修改。
+func TestE2E_StandardSingleModule(t *testing.T) {
+	h := newTestHarness(t)
+	proj := t.TempDir()
+
+	mainGoModPath := filepath.Join(proj, "go.mod")
+	mainGoModOrig := "module example.com/mainapp\n\ngo 1.24\n"
+	if err := os.WriteFile(mainGoModPath, []byte(mainGoModOrig), 0o644); err != nil {
+		t.Fatalf("write main go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	// got version
+	stdout, stderr, code := h.runGot(t, proj, nil, "version")
+	if code != 0 || !strings.Contains(stdout, "got version") {
+		t.Fatalf("got version failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	// got init
+	_, stderr, code = h.runGot(t, proj, nil, "init")
+	if code != 0 {
+		t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+	}
+
+	// 重复 got init 必须报错
+	_, _, code = h.runGot(t, proj, nil, "init")
+	if code == 0 {
+		t.Fatal("second got init should fail when got.mod already exists")
+	}
+
+	// got get -tool
+	_, stderr, code = h.runGot(t, proj, nil, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	if code != 0 {
+		t.Fatalf("got get -tool failed: code=%d stderr=%q", code, stderr)
+	}
+
+	// got list tool
+	stdout, stderr, code = h.runGot(t, proj, nil, "list", "tool")
+	if code != 0 || !strings.Contains(stdout, "example.com/probe/cmd/probetool") {
+		t.Fatalf("got list tool failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	// got tool (列表模式)
+	stdout, stderr, code = h.runGot(t, proj, nil, "tool")
+	if code != 0 || !strings.Contains(stdout, "example.com/probe/cmd/probetool") {
+		t.Fatalf("got tool list failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	// got tool -n
+	stdout, stderr, code = h.runGot(t, proj, nil, "tool", "-n", "probetool", "arg1")
+	if code != 0 || !strings.Contains(stdout, "arg1") {
+		t.Fatalf("got tool -n failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	// got tool 短名执行
+	stdout, stderr, code = h.runGot(t, proj, nil, "tool", "probetool", "hello", "world")
+	if code != 0 {
+		t.Fatalf("got tool probetool failed: code=%d stderr=%q", code, stderr)
+	}
+	var rep probeReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+		t.Fatalf("unmarshal report %q: %v", stdout, err)
+	}
+	if rep.Version != "v1.0.0" || rep.Cwd != proj {
+		t.Errorf("unexpected report: %+v", rep)
+	}
+	if len(rep.Args) != 2 || rep.Args[0] != "hello" || rep.Args[1] != "world" {
+		t.Errorf("unexpected args: %v", rep.Args)
+	}
+
+	// 退出码非 0 静默透传（不输出 got: wrapper 错误）
+	_, stderr, code = h.runGot(t, proj, nil, "tool", "probetool", "-exit=42")
+	if code != 42 {
+		t.Fatalf("expected exit code 42, got %d (stderr=%q)", code, stderr)
+	}
+	if strings.Contains(stderr, "got:") {
+		t.Errorf("non-zero tool exit should not print wrapper error, got stderr=%q", stderr)
+	}
+
+	// got get -u（无包参数，自动补充 tool 升级至 v1.1.0）
+	_, stderr, code = h.runGot(t, proj, nil, "get", "-u")
+	if code != 0 {
+		t.Fatalf("got get -u failed: code=%d stderr=%q", code, stderr)
+	}
+	stdout, stderr, code = h.runGot(t, proj, nil, "tool", "probetool")
+	if code != 0 || strings.TrimSpace(stdout) != "version=v1.1.0" {
+		t.Fatalf("expected upgraded tool v1.1.0, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	// got rm probetool
+	_, stderr, code = h.runGot(t, proj, nil, "rm", "probetool")
+	if code != 0 {
+		t.Fatalf("got rm failed: code=%d stderr=%q", code, stderr)
+	}
+	gotModAfter, err := os.ReadFile(filepath.Join(proj, "got.mod"))
+	if err != nil {
+		t.Fatalf("read got.mod: %v", err)
+	}
+	if strings.Contains(string(gotModAfter), "example.com/probe") {
+		t.Errorf("expected probe tool removed from got.mod, got:\n%s", string(gotModAfter))
+	}
+
+	// 验证主项目 go.mod 零修改且未生成 go.sum
+	mainGoModAfter, err := os.ReadFile(mainGoModPath)
+	if err != nil {
+		t.Fatalf("read main go.mod: %v", err)
+	}
+	if string(mainGoModAfter) != mainGoModOrig {
+		t.Errorf("main go.mod was modified!\nwant:\n%s\ngot:\n%s", mainGoModOrig, string(mainGoModAfter))
+	}
+	if _, err := os.Stat(filepath.Join(proj, "go.sum")); !os.IsNotExist(err) {
+		t.Errorf("main go.sum should not be created")
+	}
+}
+
+// 场景 2：go.work Workspace 项目，验证编译不报错且工具子进程实际读取原始 GOWORK。
+func TestE2E_WorkspaceGoWorkPreserved(t *testing.T) {
+	h := newTestHarness(t)
+	repo := t.TempDir()
+	modA := filepath.Join(repo, "modA")
+	if err := os.MkdirAll(modA, 0o755); err != nil {
+		t.Fatalf("mkdir modA: %v", err)
+	}
+
+	goWorkPath := filepath.Join(repo, "go.work")
+	if err := os.WriteFile(goWorkPath, []byte("go 1.24\n\nuse ./modA\n"), 0o644); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(modA, "go.mod"), []byte("module example.com/moda\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write modA/go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(modA, "a.go"), []byte("package moda\n"), 0o644); err != nil {
+		t.Fatalf("write modA/a.go: %v", err)
+	}
+
+	// 在无 go.mod 的 workspace 根目录初始化 got.mod 并安装工具
+	_, stderr, code := h.runGot(t, repo, nil, "init")
+	if code != 0 {
+		t.Fatalf("got init in workspace failed: code=%d stderr=%q", code, stderr)
+	}
+	_, stderr, code = h.runGot(t, repo, nil, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	if code != 0 {
+		t.Fatalf("got get -tool in workspace failed: code=%d stderr=%q", code, stderr)
+	}
+
+	// 在子模块 modA 目录下执行 got tool，同时显式设置 GOWORK 环境变量
+	stdout, stderr, code := h.runGot(t, modA, []string{"GOWORK=" + goWorkPath}, "tool", "probetool")
+	if code != 0 {
+		t.Fatalf("got tool in workspace failed: code=%d stderr=%q", code, stderr)
+	}
+
+	var rep probeReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+		t.Fatalf("unmarshal report %q: %v", stdout, err)
+	}
+	if rep.EnvGoWork != goWorkPath {
+		t.Errorf("child process GOWORK env = %q, want %q", rep.EnvGoWork, goWorkPath)
+	}
+	if rep.GoEnvWork != goWorkPath {
+		t.Errorf("child process `go env GOWORK` = %q, want %q", rep.GoEnvWork, goWorkPath)
+	}
+	if rep.Cwd != modA {
+		t.Errorf("child process Cwd = %q, want %q", rep.Cwd, modA)
+	}
+}
+
+// 场景 3：无 go.mod 纯目录，验证 -overlay 自动占位与无残留文件。
+func TestE2E_NoGoModOverlay(t *testing.T) {
+	h := newTestHarness(t)
+	dir := t.TempDir()
+
+	// 使用 --init 一步完成初始化与工具拉取
+	_, stderr, code := h.runGot(t, dir, nil, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	if code != 0 {
+		t.Fatalf("got get --init failed: code=%d stderr=%q", code, stderr)
+	}
+
+	stdout, stderr, code := h.runGot(t, dir, nil, "tool", "probetool")
+	if code != 0 {
+		t.Fatalf("got tool in no-go.mod dir failed: code=%d stderr=%q", code, stderr)
+	}
+	var rep probeReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+		t.Fatalf("unmarshal report %q: %v", stdout, err)
+	}
+	if rep.Version != "v1.0.0" {
+		t.Errorf("version = %q, want v1.0.0", rep.Version)
+	}
+
+	// got mod verify 同样借助 overlay 正常工作
+	_, stderr, code = h.runGot(t, dir, nil, "mod", "verify")
+	if code != 0 {
+		t.Fatalf("got mod verify failed: code=%d stderr=%q", code, stderr)
+	}
+
+	// 确认目录内不存在 go.mod 残留
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); !os.IsNotExist(err) {
+		t.Errorf("no go.mod file should be left in directory")
+	}
+}
+
+// 场景 4：//go:generate 子目录调用，验证子包 Cwd 保持与相对路径输出。
+func TestE2E_GoGenerateSubdir(t *testing.T) {
+	h := newTestHarness(t)
+	proj := t.TempDir()
+	subPkg := filepath.Join(proj, "pkg", "gen")
+	if err := os.MkdirAll(subPkg, 0o755); err != nil {
+		t.Fatalf("mkdir subpkg: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/genapp\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	genGoSrc := "package gen\n\n//go:generate got tool probetool -write=generated.txt\n"
+	if err := os.WriteFile(filepath.Join(subPkg, "gen.go"), []byte(genGoSrc), 0o644); err != nil {
+		t.Fatalf("write gen.go: %v", err)
+	}
+
+	_, stderr, code := h.runGot(t, proj, nil, "init")
+	if code != 0 {
+		t.Fatalf("got init: code=%d stderr=%q", code, stderr)
+	}
+	_, stderr, code = h.runGot(t, proj, nil, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	if code != 0 {
+		t.Fatalf("got get: code=%d stderr=%q", code, stderr)
+	}
+
+	// 将编译出的 got 二进制所在目录放到 PATH 前方后运行 go generate ./...
+	genCmd := exec.Command("go", "generate", "./...")
+	genCmd.Dir = proj
+	genEnv := make([]string, 0, len(os.Environ())+5)
+	for _, kv := range os.Environ() {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "PATH":
+			genEnv = append(genEnv, "PATH="+filepath.Dir(h.gotBin)+string(filepath.ListSeparator)+val)
+		case "GOPROXY", "GOSUMDB", "GOMODCACHE", "GOCACHE", "GOWORK", "GOFLAGS", "GOTFILE", "GOOS", "GOARCH":
+			continue
+		default:
+			genEnv = append(genEnv, kv)
+		}
+	}
+	genEnv = append(genEnv,
+		"GOPROXY="+h.proxyURL,
+		"GOSUMDB=off",
+		"GOMODCACHE="+h.goModCache,
+		"GOCACHE="+h.goCache,
+	)
+	genCmd.Env = genEnv
+
+	if out, err := genCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go generate ./... failed: %v\n%s", err, string(out))
+	}
+
+	generatedPath := filepath.Join(subPkg, "generated.txt")
+	data, err := os.ReadFile(generatedPath)
+	if err != nil {
+		t.Fatalf("expected generated file at %s: %v", generatedPath, err)
+	}
+	if !strings.Contains(string(data), "cwd="+subPkg) {
+		t.Errorf("generated file has unexpected cwd content:\n%s", string(data))
+	}
+}
+
+// 场景 5：Go 内置工具透传（含无 got.mod 与有 got.mod 两种情况）。
+func TestE2E_BuiltinToolPassthrough(t *testing.T) {
+	h := newTestHarness(t)
+	proj := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/vetapp\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	// 无 got.mod 时，内置工具 vet 应直接透传成功
+	_, stderr, code := h.runGot(t, proj, nil, "tool", "vet", "-help")
+	if code != 0 && !strings.Contains(stderr, "Usage") && !strings.Contains(stderr, "vet") {
+		t.Fatalf("got tool vet -help without got.mod failed unexpectedly: code=%d stderr=%q", code, stderr)
+	}
+
+	// 无 got.mod 时，非内置工具应提示未找到 got.mod
+	_, stderr, code = h.runGot(t, proj, nil, "tool", "custom-missing-tool")
+	if code == 0 || !strings.Contains(stderr, "got.mod not found") {
+		t.Fatalf("expected got.mod not found error for custom tool, got code=%d stderr=%q", code, stderr)
+	}
+
+	// 初始化 got.mod 后，内置工具同样正常透传
+	_, stderr, code = h.runGot(t, proj, nil, "init")
+	if code != 0 {
+		t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+	}
+	_, stderr, code = h.runGot(t, proj, nil, "tool", "vet", "-help")
+	if code != 0 && !strings.Contains(stderr, "Usage") && !strings.Contains(stderr, "vet") {
+		t.Fatalf("got tool vet -help with got.mod failed unexpectedly: code=%d stderr=%q", code, stderr)
+	}
+}
+
+// 场景 6：--same-module 本地工具、GOFLAGS=-mod=vendor 清洗、歧义检测、-C 与 GOTFILE。
+func TestE2E_AdvancedEdgeCases(t *testing.T) {
+	h := newTestHarness(t)
+
+	t.Run("same-module local tool", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/myrepo\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		localToolDir := filepath.Join(proj, "cmd", "localgen")
+		if err := os.MkdirAll(localToolDir, 0o755); err != nil {
+			t.Fatalf("mkdir cmd/localgen: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localToolDir, "main.go"), []byte("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"localgen-ok\") }\n"), 0o644); err != nil {
+			t.Fatalf("write localgen: %v", err)
+		}
+
+		_, stderr, code := h.runGot(t, proj, nil, "init", "--same-module")
+		if code != 0 {
+			t.Fatalf("got init --same-module failed: code=%d stderr=%q", code, stderr)
+		}
+		_, stderr, code = h.runGot(t, proj, nil, "mod", "edit", "-tool", "example.com/myrepo/cmd/localgen")
+		if code != 0 {
+			t.Fatalf("got mod edit -tool failed: code=%d stderr=%q", code, stderr)
+		}
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "localgen")
+		if code != 0 || strings.TrimSpace(stdout) != "localgen-ok" {
+			t.Fatalf("got tool localgen failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+
+	t.Run("GOFLAGS mod=vendor sanitized and preserved for child", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/vendapp\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		_, stderr, code := h.runGot(t, proj, []string{"GOFLAGS=-mod=vendor"}, "init")
+		if code != 0 {
+			t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+		}
+		_, stderr, code = h.runGot(t, proj, []string{"GOFLAGS=-mod=vendor"}, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got get under GOFLAGS=-mod=vendor failed: code=%d stderr=%q", code, stderr)
+		}
+		stdout, stderr, code := h.runGot(t, proj, []string{"GOFLAGS=-mod=vendor"}, "tool", "probetool")
+		if code != 0 {
+			t.Fatalf("got tool under GOFLAGS=-mod=vendor failed: code=%d stderr=%q", code, stderr)
+		}
+		var rep probeReport
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report %q: %v", stdout, err)
+		}
+		// 阶段二应保留用户原始 GOFLAGS 给工具进程
+		if rep.GoFlags != "-mod=vendor" {
+			t.Errorf("child GOFLAGS = %q, want -mod=vendor", rep.GoFlags)
+		}
+	})
+
+	t.Run("ambiguous tool names and full path disambiguation", func(t *testing.T) {
+		proj := t.TempDir()
+		_, stderr, code := h.runGot(t, proj, nil, "init")
+		if code != 0 {
+			t.Fatalf("got init: code=%d stderr=%q", code, stderr)
+		}
+		_, stderr, code = h.runGot(t, proj, nil, "get", "-tool", "example.com/conflict/a/cmd/dup@v1.0.0", "example.com/conflict/b/cmd/dup@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got get conflict tools: code=%d stderr=%q", code, stderr)
+		}
+
+		// 短名调用必须报歧义错误并列出所有冲突路径
+		_, stderr, code = h.runGot(t, proj, nil, "tool", "dup")
+		if code == 0 {
+			t.Fatal("expected ambiguity error for 'got tool dup'")
+		}
+		if !strings.Contains(stderr, "example.com/conflict/a/cmd/dup") || !strings.Contains(stderr, "example.com/conflict/b/cmd/dup") {
+			t.Errorf("ambiguity error should list both paths, got:\n%s", stderr)
+		}
+
+		// 全路径调用必须精确命中
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "example.com/conflict/b/cmd/dup")
+		if code != 0 || strings.TrimSpace(stdout) != "from-b" {
+			t.Fatalf("full path invocation failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+
+	t.Run("-C flag and GOTFILE override", func(t *testing.T) {
+		base := t.TempDir()
+		proj := filepath.Join(base, "proj")
+		other := filepath.Join(base, "other")
+		if err := os.MkdirAll(proj, 0o755); err != nil {
+			t.Fatalf("mkdir proj: %v", err)
+		}
+		if err := os.MkdirAll(other, 0o755); err != nil {
+			t.Fatalf("mkdir other: %v", err)
+		}
+
+		_, stderr, code := h.runGot(t, other, nil, "-C", proj, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got -C proj get --init failed: code=%d stderr=%q", code, stderr)
+		}
+
+		// 从 other 目录通过 -C proj 执行，Cwd 应为 proj
+		stdout, stderr, code := h.runGot(t, other, nil, "-C", proj, "tool", "probetool")
+		if code != 0 {
+			t.Fatalf("got -C proj tool failed: code=%d stderr=%q", code, stderr)
+		}
+		var rep probeReport
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report: %v", err)
+		}
+		if rep.Cwd != proj {
+			t.Errorf("Cwd with -C = %q, want %q", rep.Cwd, proj)
+		}
+
+		// 从 other 目录通过 GOTFILE 执行，Cwd 应保持为 other
+		gotModPath := filepath.Join(proj, "got.mod")
+		stdout, stderr, code = h.runGot(t, other, []string{"GOTFILE=" + gotModPath}, "tool", "probetool")
+		if code != 0 {
+			t.Fatalf("got with GOTFILE failed: code=%d stderr=%q", code, stderr)
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report: %v", err)
+		}
+		if rep.Cwd != other {
+			t.Errorf("Cwd with GOTFILE = %q, want %q", rep.Cwd, other)
+		}
+	})
+
+	t.Run("exe alias for tool", func(t *testing.T) {
+		proj := t.TempDir()
+		other := t.TempDir()
+
+		_, stderr, code := h.runGot(t, proj, nil, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got get --init failed: code=%d stderr=%q", code, stderr)
+		}
+
+		// got exe 列表模式
+		stdout, stderr, code := h.runGot(t, proj, nil, "exe")
+		if code != 0 || !strings.Contains(stdout, "example.com/probe/cmd/probetool") {
+			t.Fatalf("got exe list failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+
+		// got exe -n
+		stdout, stderr, code = h.runGot(t, proj, nil, "exe", "-n", "probetool", "arg1")
+		if code != 0 || !strings.Contains(stdout, "arg1") {
+			t.Fatalf("got exe -n failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+
+		// got exe 执行工具（兼容子命令后置 -C）
+		stdout, stderr, code = h.runGot(t, other, nil, "exe", "-C", proj, "probetool", "foo", "bar")
+		if code != 0 {
+			t.Fatalf("got exe -C proj probetool failed: code=%d stderr=%q", code, stderr)
+		}
+		var rep probeReport
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report %q: %v", stdout, err)
+		}
+		if rep.Version != "v1.0.0" || rep.Cwd != proj || len(rep.Args) != 2 || rep.Args[0] != "foo" || rep.Args[1] != "bar" {
+			t.Errorf("unexpected report from got exe: %+v", rep)
+		}
+
+		// got exe 透传 Go 内置工具
+		_, stderr, code = h.runGot(t, other, nil, "exe", "vet", "-help")
+		if code != 0 && !strings.Contains(stderr, "Usage") && !strings.Contains(stderr, "vet") {
+			t.Fatalf("got exe vet -help failed unexpectedly: code=%d stderr=%q", code, stderr)
+		}
+	})
+
+	t.Run("cross-compile GOOS/GOARCH builds host binary and preserves child env", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/crossapp\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+
+		// 构造与当前宿主机必然不同的 GOOS 与 GOARCH 组合
+		targetOS := "windows"
+		if runtime.GOOS == "windows" {
+			targetOS = "linux"
+		}
+		targetArch := "arm64"
+		if runtime.GOARCH == "arm64" {
+			targetArch = "amd64"
+		}
+		crossEnv := []string{
+			"GOOS=" + targetOS,
+			"GOARCH=" + targetArch,
+		}
+
+		_, stderr, code := h.runGot(t, proj, crossEnv, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got get under cross-compile env failed: code=%d stderr=%q", code, stderr)
+		}
+
+		// 阶段一必须按宿主机 GOHOSTOS/GOHOSTARCH 编译（不会出现 exec format error），
+		// 阶段二执行工具时仍须保留用户原始的 GOOS/GOARCH。
+		for _, sub := range []string{"tool", "exe"} {
+			stdout, stderr, code := h.runGot(t, proj, crossEnv, sub, "probetool")
+			if code != 0 {
+				t.Fatalf("got %s probetool under GOOS=%s GOARCH=%s failed: code=%d stderr=%q",
+					sub, targetOS, targetArch, code, stderr)
+			}
+			var rep probeReport
+			if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+				t.Fatalf("unmarshal report %q: %v", stdout, err)
+			}
+			if rep.Version != "v1.0.0" {
+				t.Errorf("got %s version = %q, want v1.0.0", sub, rep.Version)
+			}
+			if rep.EnvGoOS != targetOS || rep.EnvGoArch != targetArch {
+				t.Errorf("got %s child env GOOS/GOARCH = (%q, %q), want (%q, %q)",
+					sub, rep.EnvGoOS, rep.EnvGoArch, targetOS, targetArch)
+			}
+		}
+	})
+}
