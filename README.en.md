@@ -102,7 +102,7 @@ got [-C <dir>] <command> [arguments]
 
 | Command | Examples | Behavior |
 | :--- | :--- | :--- |
-| **`got init`** | `got init [module-path]`<br>`got init --same-module` | Creates a new `got.mod`. Defaults to `got.local/tools`; `--same-module` copies the module path from a sibling `go.mod` to support local repository tools. |
+| **`got init`** | `got init [module-path]`<br>`got init --same-module` | Creates a new `got.mod`. Defaults to `got.local/tools`; `--same-module` copies the module path from a sibling `go.mod`. If a sibling `go.mod` already declares `tool` entries, `got init` automatically copies them into `got.mod` and fetches their pinned dependency versions (auto-adopting the main module path when local repository tools are present). |
 | **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get --init -tool pkg@latest`<br>`got get -u` | Delegates to `go get -modfile=<got.mod>`. `--init` auto-initializes `got.mod` if missing; `got get -u` with no package arguments automatically appends the `tool` meta-pattern. |
 | **`got rm`**<br>(alias `remove`) | `got rm stringer`<br>`got rm example.com/a/cmd/gen` | Accepts short names or full import paths. Runs `go get -tool <pkg>@none` followed by `go mod tidy` to remove tools and prune dependencies in one step. |
 | **`got tool`**<br>(alias `exe`) | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | Lists tools when called with no arguments; runs tools declared in `got.mod` via the two-stage build-and-exec engine (`-n` prints the cached binary path); passes undeclared names through to native `go tool`. |

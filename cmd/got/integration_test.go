@@ -136,6 +136,18 @@ func newTestHarness(t *testing.T) *testHarness {
 		"a/cmd/dup/main.go": fmt.Sprintf(simpleToolSourceTemplate, "from-a"),
 		"b/cmd/dup/main.go": fmt.Sprintf(simpleToolSourceTemplate, "from-b"),
 	})
+	publishFakeModule(t, proxyDir, "example.com/helper", "v1.0.0", map[string]string{
+		"go.mod":    "module example.com/helper\n\ngo 1.24\n",
+		"helper.go": "package helper\n\nconst Version = \"helper-v1.0.0\"\n",
+	})
+	publishFakeModule(t, proxyDir, "example.com/helper", "v1.1.0", map[string]string{
+		"go.mod":    "module example.com/helper\n\ngo 1.24\n",
+		"helper.go": "package helper\n\nconst Version = \"helper-v1.1.0\"\n",
+	})
+	publishFakeModule(t, proxyDir, "example.com/biz", "v1.0.0", map[string]string{
+		"go.mod": "module example.com/biz\n\ngo 1.24\n",
+		"biz.go": "package biz\n\nconst Name = \"biz\"\n",
+	})
 
 	// 复用宿主 GOCACHE 以加快集成测试编译速度，但隔离 GOMODCACHE 以防污染宿主机模块缓存
 	goCacheBytes, err := exec.Command("go", "env", "GOCACHE").Output()
@@ -776,6 +788,164 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 				t.Errorf("got %s child env GOOS/GOARCH = (%q, %q), want (%q, %q)",
 					sub, rep.EnvGoOS, rep.EnvGoArch, targetOS, targetArch)
 			}
+		}
+	})
+
+	t.Run("init migrates external tools from go.mod with exact versions", func(t *testing.T) {
+		proj := t.TempDir()
+		mainGoMod := strings.Join([]string{
+			"module example.com/migapp",
+			"",
+			"go 1.24",
+			"",
+			"tool (",
+			"\texample.com/probe/cmd/probetool",
+			"\texample.com/conflict/a/cmd/dup",
+			")",
+			"",
+			"require (",
+			"\texample.com/biz v1.0.0",
+			"\texample.com/conflict v1.0.0 // indirect",
+			"\texample.com/probe v1.0.0 // indirect",
+			")",
+			"",
+		}, "\n")
+		mainGoModPath := filepath.Join(proj, "go.mod")
+		if err := os.WriteFile(mainGoModPath, []byte(mainGoMod), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\n\nimport _ \"example.com/biz\"\n\nfunc main() {}\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+
+		// 执行 got init，应自动复制 go.mod 中的 tool 列表并按 v1.0.0 精确拉取（而非升级到 v1.1.0）
+		_, stderr, code := h.runGot(t, proj, nil, "init")
+		if code != 0 {
+			t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+		}
+
+		gotModBytes, err := os.ReadFile(filepath.Join(proj, "got.mod"))
+		if err != nil {
+			t.Fatalf("read got.mod: %v", err)
+		}
+		gotModStr := string(gotModBytes)
+		if !strings.Contains(gotModStr, "example.com/probe/cmd/probetool") || !strings.Contains(gotModStr, "example.com/conflict/a/cmd/dup") {
+			t.Errorf("got.mod missing migrated tools:\n%s", gotModStr)
+		}
+		if !strings.Contains(gotModStr, "example.com/probe v1.0.0") {
+			t.Errorf("expected exact version example.com/probe v1.0.0 in got.mod, got:\n%s", gotModStr)
+		}
+		if strings.Contains(gotModStr, "example.com/biz") {
+			t.Errorf("business dependency example.com/biz must not leak into got.mod:\n%s", gotModStr)
+		}
+		if _, err := os.Stat(filepath.Join(proj, "got.sum")); err != nil {
+			t.Errorf("expected got.sum to be initialized: %v", err)
+		}
+
+		// 验证主项目 go.mod 未被修改
+		mainAfter, err := os.ReadFile(mainGoModPath)
+		if err != nil {
+			t.Fatalf("read main go.mod: %v", err)
+		}
+		if string(mainAfter) != mainGoMod {
+			t.Errorf("main go.mod was modified during got init")
+		}
+
+		// 验证 got mod verify 与直接执行两个工具均正常
+		_, stderr, code = h.runGot(t, proj, nil, "mod", "verify")
+		if code != 0 {
+			t.Fatalf("got mod verify failed: code=%d stderr=%q", code, stderr)
+		}
+
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "probetool")
+		if code != 0 {
+			t.Fatalf("got tool probetool failed: code=%d stderr=%q", code, stderr)
+		}
+		var rep probeReport
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report %q: %v", stdout, err)
+		}
+		if rep.Version != "v1.0.0" {
+			t.Errorf("migrated probetool version = %q, want v1.0.0", rep.Version)
+		}
+
+		stdout, stderr, code = h.runGot(t, proj, nil, "exe", "dup")
+		if code != 0 || strings.TrimSpace(stdout) != "from-a" {
+			t.Fatalf("got exe dup failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+
+	t.Run("init migrates mixed local and external tools from go.mod", func(t *testing.T) {
+		proj := t.TempDir()
+		mainGoMod := strings.Join([]string{
+			"module example.com/mixapp",
+			"",
+			"go 1.24",
+			"",
+			"tool (",
+			"\texample.com/mixapp/cmd/localgen",
+			"\texample.com/probe/cmd/probetool",
+			")",
+			"",
+			"require (",
+			"\texample.com/biz v1.0.0",
+			"\texample.com/helper v1.0.0",
+			"\texample.com/probe v1.0.0 // indirect",
+			")",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte(mainGoMod), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\n\nimport _ \"example.com/biz\"\n\nfunc main() {}\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+		localToolDir := filepath.Join(proj, "cmd", "localgen")
+		if err := os.MkdirAll(localToolDir, 0o755); err != nil {
+			t.Fatalf("mkdir cmd/localgen: %v", err)
+		}
+		localToolSrc := "package main\n\nimport (\n\t\"fmt\"\n\t\"example.com/helper\"\n)\n\nfunc main() { fmt.Println(helper.Version) }\n"
+		if err := os.WriteFile(filepath.Join(localToolDir, "main.go"), []byte(localToolSrc), 0o644); err != nil {
+			t.Fatalf("write cmd/localgen/main.go: %v", err)
+		}
+
+		// 先在主项目中生成完整 go.sum，确保主项目 go list -deps 正常解析
+		tidyCmd := exec.Command("go", "mod", "tidy")
+		tidyCmd.Dir = proj
+		tidyCmd.Env = append(os.Environ(),
+			"GOPROXY="+h.proxyURL,
+			"GOSUMDB=off",
+			"GOMODCACHE="+h.goModCache,
+			"GOCACHE="+h.goCache,
+			"GOWORK=off",
+		)
+		if out, err := tidyCmd.CombinedOutput(); err != nil {
+			t.Fatalf("prepare main go mod tidy failed: %v\n%s", err, string(out))
+		}
+
+		_, stderr, code := h.runGot(t, proj, nil, "init")
+		if code != 0 {
+			t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+		}
+
+		gotModBytes, err := os.ReadFile(filepath.Join(proj, "got.mod"))
+		if err != nil {
+			t.Fatalf("read got.mod: %v", err)
+		}
+		gotModStr := string(gotModBytes)
+		if !strings.Contains(gotModStr, "module example.com/mixapp") {
+			t.Errorf("expected got.mod to adopt main module path for local tool:\n%s", gotModStr)
+		}
+		if !strings.Contains(gotModStr, "example.com/helper v1.0.0") {
+			t.Errorf("expected exact helper v1.0.0 in got.mod:\n%s", gotModStr)
+		}
+		if strings.Contains(gotModStr, "example.com/biz") {
+			t.Errorf("business dependency example.com/biz must not leak into got.mod:\n%s", gotModStr)
+		}
+
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "localgen")
+		if code != 0 || strings.TrimSpace(stdout) != "helper-v1.0.0" {
+			t.Fatalf("got tool localgen failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 	})
 }

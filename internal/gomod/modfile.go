@@ -49,13 +49,71 @@ type ModEditJSON struct {
 	Module struct {
 		Path string `json:"Path"`
 	} `json:"Module"`
-	Go   string     `json:"Go"`
-	Tool []ToolItem `json:"Tool"`
+	Go      string        `json:"Go"`
+	Require []RequireItem `json:"Require"`
+	Replace []ReplaceItem `json:"Replace"`
+	Tool    []ToolItem    `json:"Tool"`
+}
+
+// RequireItem 表示模块清单中的单条 require 依赖。
+type RequireItem struct {
+	Path     string `json:"Path"`
+	Version  string `json:"Version"`
+	Indirect bool   `json:"Indirect"`
+}
+
+// ReplaceItem 表示模块清单中的单条 replace 规则。
+type ReplaceItem struct {
+	Old ModuleVersion `json:"Old"`
+	New ModuleVersion `json:"New"`
+}
+
+// ModuleVersion 表示模块路径与可选版本号。
+type ModuleVersion struct {
+	Path    string `json:"Path"`
+	Version string `json:"Version"`
 }
 
 // ToolItem 表示 got.mod 中声明的单条 tool 指令。
 type ToolItem struct {
 	Path string `json:"Path"`
+}
+
+// IsPackageInModule 判断包路径 pkgPath 是否隶属于模块 modPath。
+func IsPackageInModule(pkgPath, modPath string) bool {
+	if pkgPath == "" || modPath == "" {
+		return false
+	}
+	return pkgPath == modPath || strings.HasPrefix(pkgPath, modPath+"/")
+}
+
+// MatchRequireModule 在 require 列表中按最长模块路径前缀匹配 pkgPath 所属模块。
+func MatchRequireModule(pkgPath string, requires []RequireItem) (RequireItem, bool) {
+	var best RequireItem
+	found := false
+	for _, req := range requires {
+		if !IsPackageInModule(pkgPath, req.Path) {
+			continue
+		}
+		if !found || len(req.Path) > len(best.Path) {
+			best = req
+			found = true
+		}
+	}
+	return best, found
+}
+
+// FormatReplaceArg 将 ReplaceItem 格式化为 `go mod edit -replace=<arg>` 接受的参数形式。
+func FormatReplaceArg(rep ReplaceItem) string {
+	oldSpec := rep.Old.Path
+	if rep.Old.Version != "" {
+		oldSpec += "@" + rep.Old.Version
+	}
+	newSpec := rep.New.Path
+	if rep.New.Version != "" {
+		newSpec += "@" + rep.New.Version
+	}
+	return oldSpec + "=" + newSpec
 }
 
 // ParseModFile 调用 `go mod edit -json <modFilePath>` 解析模块文件。

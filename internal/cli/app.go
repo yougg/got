@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 
 	"github.com/yougg/got/internal/executor"
@@ -106,7 +109,7 @@ func (a *App) Run(ctx context.Context, args []string) (int, error) {
 
 	switch subcmd {
 	case "init":
-		return a.runInit(ctx, workDir, gotFileEnv, envInfo, subArgs)
+		return a.runInit(ctx, r, workDir, gotFileEnv, envInfo, subArgs)
 	case "get":
 		return a.runGet(ctx, r, workDir, gotFileEnv, envInfo, subArgs)
 	case "rm", "remove":
@@ -158,7 +161,7 @@ func ParseGlobalFlags(args []string) (chDir string, rest []string, err error) {
 	return chDir, args[i:], nil
 }
 
-func (a *App) runInit(ctx context.Context, workDir, gotFileEnv string, envInfo *gomod.EnvInfo, args []string) (int, error) {
+func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv string, envInfo *gomod.EnvInfo, args []string) (int, error) {
 	sameModule := false
 	var positional []string
 
@@ -193,23 +196,55 @@ func (a *App) runInit(ctx context.Context, workDir, gotFileEnv string, envInfo *
 		}
 	}
 
+	// 若同级存在 go.mod，预先解析以便 --same-module 及自动迁移其中的 tool 列表
+	rootDir := filepath.Dir(targetPath)
+	mainGoMod := filepath.Join(rootDir, locator.GoModFileName)
+	var mainMod *gomod.ModEditJSON
+	if info, statErr := os.Stat(mainGoMod); statErr == nil && !info.IsDir() {
+		parsed, parseErr := gomod.ParseModFile(ctx, mainGoMod)
+		if parseErr != nil {
+			if sameModule {
+				return 1, fmt.Errorf("failed to read main module path from %s: %w", mainGoMod, parseErr)
+			}
+			slog.Debug("解析同级 go.mod 失败，跳过自动迁移 tool 列表", "path", mainGoMod, "err", parseErr)
+		} else {
+			mainMod = parsed
+		}
+	} else if sameModule {
+		return 1, fmt.Errorf("--same-module requires %s to exist: %w", mainGoMod, statErr)
+	}
+
+	var localTools []string
+	var externalTools []string
+	if mainMod != nil && len(mainMod.Tool) > 0 {
+		for _, item := range mainMod.Tool {
+			if item.Path == "" {
+				continue
+			}
+			if gomod.IsPackageInModule(item.Path, mainMod.Module.Path) {
+				if !slices.Contains(localTools, item.Path) {
+					localTools = append(localTools, item.Path)
+				}
+			} else {
+				if !slices.Contains(externalTools, item.Path) {
+					externalTools = append(externalTools, item.Path)
+				}
+			}
+		}
+	}
+
 	var modulePath string
 	switch {
 	case sameModule:
-		mainGoMod := filepath.Join(filepath.Dir(targetPath), locator.GoModFileName)
-		if _, err := os.Stat(mainGoMod); err != nil {
-			return 1, fmt.Errorf("--same-module requires %s to exist: %w", mainGoMod, err)
-		}
-		parsed, err := gomod.ParseModFile(ctx, mainGoMod)
-		if err != nil {
-			return 1, fmt.Errorf("failed to read main module path from %s: %w", mainGoMod, err)
-		}
-		if parsed.Module.Path == "" {
+		if mainMod == nil || mainMod.Module.Path == "" {
 			return 1, fmt.Errorf("main module path in %s is empty", mainGoMod)
 		}
-		modulePath = parsed.Module.Path
+		modulePath = mainMod.Module.Path
 	case len(positional) == 1:
 		modulePath = positional[0]
+	case len(localTools) > 0 && mainMod != nil && mainMod.Module.Path != "":
+		// 存在仓库本地工具时，自动与主模块路径保持一致以便 Go 解析本地工具包
+		modulePath = mainMod.Module.Path
 	default:
 		modulePath = DefaultToolModulePath
 	}
@@ -219,7 +254,171 @@ func (a *App) runInit(ctx context.Context, workDir, gotFileEnv string, envInfo *
 	}
 
 	fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), modulePath)
+
+	// 若主项目 go.mod 中存在 tool 列表，自动复制到 got.mod 并拉取对应版本的依赖包
+	if len(localTools) > 0 || len(externalTools) > 0 {
+		sumPath := strings.TrimSuffix(targetPath, ".mod") + ".sum"
+		_, sumExistedErr := os.Stat(sumPath)
+		sumExisted := sumExistedErr == nil
+
+		loc := &locator.Context{
+			ModFile:     targetPath,
+			RootDir:     rootDir,
+			HasGoMod:    true,
+			OrigWorkDir: workDir,
+		}
+		code, migrateErr := a.migrateToolsFromGoMod(ctx, r, loc, mainMod, localTools, externalTools)
+		if migrateErr != nil || code != 0 {
+			// 初始化拉取失败时清理半成品文件，避免阻断后续重试
+			_ = os.Remove(targetPath)
+			if !sumExisted {
+				_ = os.Remove(sumPath)
+			}
+			return code, migrateErr
+		}
+	}
+
 	return 0, nil
+}
+
+// migrateToolsFromGoMod 将主项目 go.mod 中的 tool 列表复制到 got.mod，
+// 并按 go.mod 中记录的对应版本拉取这些工具依赖的包完成初始化。
+func (a *App) migrateToolsFromGoMod(
+	ctx context.Context,
+	r *runner.Runner,
+	loc *locator.Context,
+	mainMod *gomod.ModEditJSON,
+	localTools []string,
+	externalTools []string,
+) (int, error) {
+	total := len(localTools) + len(externalTools)
+	fmt.Fprintf(a.Stderr, "got: migrating %d tool(s) from go.mod to %s\n", total, filepath.Base(loc.ModFile))
+
+	appliedReplaces := make(map[string]bool)
+	applyReplacesForModules := func(modPaths []string) (int, error) {
+		var editArgs []string
+		for _, rep := range mainMod.Replace {
+			if !slices.Contains(modPaths, rep.Old.Path) {
+				continue
+			}
+			arg := gomod.FormatReplaceArg(rep)
+			if appliedReplaces[arg] {
+				continue
+			}
+			appliedReplaces[arg] = true
+			if len(editArgs) == 0 {
+				editArgs = append(editArgs, "edit")
+			}
+			editArgs = append(editArgs, "-replace="+arg)
+		}
+		if len(editArgs) == 0 {
+			return 0, nil
+		}
+		return r.RunStreaming(ctx, loc, "mod", editArgs)
+	}
+
+	// 1. 迁移外部工具：按主项目 go.mod 中锁定的对应版本精确拉取
+	if len(externalTools) > 0 {
+		var toolModPaths []string
+		getArgs := make([]string, 0, 1+len(externalTools))
+		getArgs = append(getArgs, "-tool")
+
+		for _, toolPath := range externalTools {
+			if req, ok := gomod.MatchRequireModule(toolPath, mainMod.Require); ok && req.Version != "" {
+				if !slices.Contains(toolModPaths, req.Path) {
+					toolModPaths = append(toolModPaths, req.Path)
+				}
+				getArgs = append(getArgs, toolPath+"@"+req.Version)
+			} else {
+				// 兜底检查 replace 中是否存在匹配前缀
+				for _, rep := range mainMod.Replace {
+					if gomod.IsPackageInModule(toolPath, rep.Old.Path) && !slices.Contains(toolModPaths, rep.Old.Path) {
+						toolModPaths = append(toolModPaths, rep.Old.Path)
+					}
+				}
+				getArgs = append(getArgs, toolPath)
+			}
+		}
+
+		if code, err := applyReplacesForModules(toolModPaths); err != nil || code != 0 {
+			return code, err
+		}
+		if code, err := r.RunStreaming(ctx, loc, "get", getArgs); err != nil || code != 0 {
+			return code, err
+		}
+	}
+
+	// 2. 迁移仓库本地工具：写入 tool 声明，并精准拉取本地工具自身依赖的外部包版本
+	if len(localTools) > 0 {
+		editArgs := make([]string, 0, 1+len(localTools))
+		editArgs = append(editArgs, "edit")
+		for _, toolPath := range localTools {
+			editArgs = append(editArgs, "-tool="+toolPath)
+		}
+		if code, err := r.RunStreaming(ctx, loc, "mod", editArgs); err != nil || code != 0 {
+			return code, err
+		}
+
+		depSpecs, depModPaths, err := queryLocalToolDeps(ctx, r, loc.RootDir, localTools)
+		if err != nil {
+			return 1, err
+		}
+		if code, err := applyReplacesForModules(depModPaths); err != nil || code != 0 {
+			return code, err
+		}
+		if len(depSpecs) > 0 {
+			if code, err := r.RunStreaming(ctx, loc, "get", depSpecs); err != nil || code != 0 {
+				return code, err
+			}
+		}
+	}
+
+	// 3. 确保 got.mod 中记录的所有工具依赖包均已下载到模块缓存
+	return r.RunStreaming(ctx, loc, "mod", []string{"download"})
+}
+
+// queryLocalToolDeps 在主项目 go.mod 上下文中查询仓库本地工具依赖的外部模块及对应版本。
+func queryLocalToolDeps(ctx context.Context, r *runner.Runner, rootDir string, localTools []string) (specs, modPaths []string, err error) {
+	args := make([]string, 0, 3+len(localTools))
+	args = append(args, "list", "-deps", "-f", "{{if .Module}}{{if not .Module.Main}}{{.Module.Path}}@{{.Module.Version}}{{end}}{{end}}")
+	args = append(args, localTools...)
+
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = rootDir
+	cmd.Env = runner.BuildGoEnv(os.Environ(), r.HostOS, r.HostArch)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	slog.Debug("查询本地工具依赖的外部模块版本", "args", cmd.Args, "dir", cmd.Dir)
+	if runErr := cmd.Run(); runErr != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return nil, nil, fmt.Errorf("failed to inspect local tool dependencies: %s: %w", errMsg, runErr)
+		}
+		return nil, nil, fmt.Errorf("failed to inspect local tool dependencies: %w", runErr)
+	}
+
+	for line := range strings.SplitSeq(stdout.String(), "\n") {
+		spec := strings.TrimSpace(line)
+		if spec == "" {
+			continue
+		}
+		modPath, ver, ok := strings.Cut(spec, "@")
+		if !ok || modPath == "" {
+			continue
+		}
+		if !slices.Contains(modPaths, modPath) {
+			modPaths = append(modPaths, modPath)
+		}
+		if ver == "" {
+			spec = modPath
+		}
+		if !slices.Contains(specs, spec) {
+			specs = append(specs, spec)
+		}
+	}
+	return specs, modPaths, nil
 }
 
 func createGotMod(targetPath, modulePath, goVersion string) error {

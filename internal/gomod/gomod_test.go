@@ -174,3 +174,54 @@ func TestParseModFileAndIsBuiltinTool(t *testing.T) {
 		t.Fatalf("len(Tool) = %d, want 2", len(parsed.Tool))
 	}
 }
+
+func TestIsPackageInModuleAndMatchRequire(t *testing.T) {
+	if !IsPackageInModule("example.com/a/cmd/tool", "example.com/a") {
+		t.Error("expected subpackage to match module")
+	}
+	if !IsPackageInModule("example.com/a", "example.com/a") {
+		t.Error("expected root package to match module")
+	}
+	if IsPackageInModule("example.com/ab/cmd/tool", "example.com/a") {
+		t.Error("prefix without slash boundary must not match")
+	}
+
+	requires := []RequireItem{
+		{Path: "example.com/foo", Version: "v1.0.0"},
+		{Path: "example.com/foo/sub", Version: "v2.3.4"},
+		{Path: "example.com/other", Version: "v0.1.0"},
+	}
+
+	// 应优先匹配更长的嵌套子模块路径
+	req, ok := MatchRequireModule("example.com/foo/sub/cmd/gen", requires)
+	if !ok || req.Path != "example.com/foo/sub" || req.Version != "v2.3.4" {
+		t.Fatalf("MatchRequireModule nested = (%+v, %v), want example.com/foo/sub@v2.3.4", req, ok)
+	}
+
+	req, ok = MatchRequireModule("example.com/foo/cmd/gen", requires)
+	if !ok || req.Path != "example.com/foo" || req.Version != "v1.0.0" {
+		t.Fatalf("MatchRequireModule parent = (%+v, %v), want example.com/foo@v1.0.0", req, ok)
+	}
+
+	if _, ok := MatchRequireModule("example.com/missing/cmd/x", requires); ok {
+		t.Error("expected no match for missing module")
+	}
+}
+
+func TestFormatReplaceArg(t *testing.T) {
+	got := FormatReplaceArg(ReplaceItem{
+		Old: ModuleVersion{Path: "example.com/old"},
+		New: ModuleVersion{Path: "./local/old"},
+	})
+	if got != "example.com/old=./local/old" {
+		t.Errorf("FormatReplaceArg = %q, want example.com/old=./local/old", got)
+	}
+
+	got = FormatReplaceArg(ReplaceItem{
+		Old: ModuleVersion{Path: "example.com/old", Version: "v1.0.0"},
+		New: ModuleVersion{Path: "example.com/new", Version: "v1.2.3"},
+	})
+	if got != "example.com/old@v1.0.0=example.com/new@v1.2.3" {
+		t.Errorf("FormatReplaceArg = %q, want example.com/old@v1.0.0=example.com/new@v1.2.3", got)
+	}
+}

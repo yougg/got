@@ -73,7 +73,7 @@ got tool
 
 # 4. 运行工具（支持短名或完整包路径）
 got tool golangci-lint run ./...
-got tool stringer -type=Status
+got exe stringer -type=Status
 
 # 5. 更新 got.mod 中声明的所有工具
 got get -u
@@ -102,7 +102,7 @@ got [-C <dir>] <command> [arguments]
 
 | 命令 | 示例 | 说明 |
 | :--- | :--- | :--- |
-| **`got init`** | `got init [module-path]`<br>`got init --same-module` | 初始化 `got.mod`。默认使用 `got.local/tools`；指定 `--same-module` 时复用同级 `go.mod` 的模块路径以支持仓库本地工具。 |
+| **`got init`** | `got init [module-path]`<br>`got init --same-module` | 初始化 `got.mod`。默认使用 `got.local/tools`；指定 `--same-module` 时复用同级 `go.mod` 的模块路径。若同级 `go.mod` 中已存在 `tool` 列表，会自动复制到 `got.mod` 并按对应版本拉取依赖包完成初始化（包含仓库本地工具时自动复用主模块路径）。 |
 | **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get --init -tool pkg@latest`<br>`got get -u` | 透传至 `go get -modfile=<got.mod>`。使用 `--init` 可在缺失 `got.mod` 时自动初始化；使用 `got get -u` 且未传包参数时自动追加 `tool` 元包模式。 |
 | **`got rm`**<br>（别名 `remove`） | `got rm stringer`<br>`got rm example.com/a/cmd/gen` | 支持短名或完整包路径，依次执行 `go get -tool <pkg>@none` 与 `go mod tidy`，一步移除工具并清理依赖。 |
 | **`got tool`**<br>（别名 `exe`） | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | 无参数时列出可用工具；匹配 `got.mod` 时走两阶段编译与执行引擎（带 `-n` 仅打印缓存二进制路径）；未匹配时按 Go 内置工具原样透传 `go tool`。 |
