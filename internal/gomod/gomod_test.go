@@ -224,4 +224,11 @@ func TestFormatReplaceArg(t *testing.T) {
 	if got != "example.com/old@v1.0.0=example.com/new@v1.2.3" {
 		t.Errorf("FormatReplaceArg = %q, want example.com/old@v1.0.0=example.com/new@v1.2.3", got)
 	}
+
+	if drop := FormatDropReplaceArg(ReplaceItem{Old: ModuleVersion{Path: "example.com/old"}}); drop != "example.com/old" {
+		t.Errorf("FormatDropReplaceArg = %q, want example.com/old", drop)
+	}
+	if drop := FormatDropReplaceArg(ReplaceItem{Old: ModuleVersion{Path: "example.com/old", Version: "v1.0.0"}}); drop != "example.com/old@v1.0.0" {
+		t.Errorf("FormatDropReplaceArg(versioned) = %q, want example.com/old@v1.0.0", drop)
+	}
 }

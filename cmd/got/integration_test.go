@@ -148,6 +148,19 @@ func newTestHarness(t *testing.T) *testHarness {
 		"go.mod": "module example.com/biz\n\ngo 1.24\n",
 		"biz.go": "package biz\n\nconst Name = \"biz\"\n",
 	})
+	publishFakeModule(t, proxyDir, "example.com/bizfork", "v1.0.0", map[string]string{
+		"go.mod": "module example.com/biz\n\ngo 1.24\n",
+		"biz.go": "package biz\n\nconst Name = \"biz-fork\"\n",
+	})
+	// 模拟直接 replace 的工具模块及其传递依赖 replace 模块
+	publishFakeModule(t, proxyDir, "example.com/forkdep", "v1.5.1", map[string]string{
+		"go.mod":     "module example.com/origdep\n\ngo 1.24\n",
+		"ext/ext.go": "package ext\n\nconst Tag = \"forkdep-v1.5.1\"\n",
+	})
+	publishFakeModule(t, proxyDir, "example.com/forktool", "v1.2.0", map[string]string{
+		"go.mod":            "module example.com/origtool\n\ngo 1.24\n\nrequire example.com/origdep v1.5.0\n",
+		"cmd/ftool/main.go": "package main\n\nimport (\n\t\"fmt\"\n\t\"example.com/origdep/ext\"\n)\n\nfunc main() { fmt.Println(\"ftool:\" + ext.Tag) }\n",
+	})
 
 	// 复用宿主 GOCACHE 以加快集成测试编译速度，但隔离 GOMODCACHE 以防污染宿主机模块缓存
 	goCacheBytes, err := exec.Command("go", "env", "GOCACHE").Output()
@@ -946,6 +959,75 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "localgen")
 		if code != 0 || strings.TrimSpace(stdout) != "helper-v1.0.0" {
 			t.Fatalf("got tool localgen failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+
+	t.Run("init migrates direct and transitive replaces for tools without leaking business replaces", func(t *testing.T) {
+		proj := t.TempDir()
+		mainGoMod := strings.Join([]string{
+			"module example.com/repapp",
+			"",
+			"go 1.24",
+			"",
+			"tool example.com/origtool/cmd/ftool",
+			"",
+			"require (",
+			"\texample.com/biz v1.0.0",
+			"\texample.com/origdep v1.5.0 // indirect",
+			"\texample.com/origtool v0.0.0-00010101000000-000000000000 // indirect",
+			")",
+			"",
+			"replace (",
+			"\texample.com/biz => example.com/bizfork v1.0.0",
+			"\texample.com/origdep => example.com/forkdep v1.5.1",
+			"\texample.com/origtool => example.com/forktool v1.2.0",
+			")",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte(mainGoMod), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\n\nimport _ \"example.com/biz\"\n\nfunc main() {}\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+
+		// 先为测试项目补齐主项目 go.sum
+		tidyCmd := exec.Command("go", "mod", "tidy")
+		tidyCmd.Dir = proj
+		tidyCmd.Env = append(os.Environ(),
+			"GOPROXY="+h.proxyURL,
+			"GOSUMDB=off",
+			"GOMODCACHE="+h.goModCache,
+			"GOCACHE="+h.goCache,
+			"GOWORK=off",
+		)
+		if out, err := tidyCmd.CombinedOutput(); err != nil {
+			t.Fatalf("prepare main go mod tidy failed: %v\n%s", err, string(out))
+		}
+
+		_, stderr, code := h.runGot(t, proj, nil, "init")
+		if code != 0 {
+			t.Fatalf("got init with direct+transitive replace failed: code=%d stderr=%q", code, stderr)
+		}
+
+		gotModBytes, err := os.ReadFile(filepath.Join(proj, "got.mod"))
+		if err != nil {
+			t.Fatalf("read got.mod: %v", err)
+		}
+		gotModStr := string(gotModBytes)
+		if !strings.Contains(gotModStr, "example.com/origtool => example.com/forktool v1.2.0") {
+			t.Errorf("missing direct tool replace in got.mod:\n%s", gotModStr)
+		}
+		if !strings.Contains(gotModStr, "example.com/origdep => example.com/forkdep v1.5.1") {
+			t.Errorf("missing transitive dep replace in got.mod:\n%s", gotModStr)
+		}
+		if strings.Contains(gotModStr, "example.com/bizfork") || strings.Contains(gotModStr, "example.com/biz") {
+			t.Errorf("business replace must not leak into got.mod:\n%s", gotModStr)
+		}
+
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "ftool")
+		if code != 0 || strings.TrimSpace(stdout) != "ftool:forkdep-v1.5.1" {
+			t.Fatalf("got tool ftool failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 	})
 }

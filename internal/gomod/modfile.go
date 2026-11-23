@@ -105,15 +105,20 @@ func MatchRequireModule(pkgPath string, requires []RequireItem) (RequireItem, bo
 
 // FormatReplaceArg 将 ReplaceItem 格式化为 `go mod edit -replace=<arg>` 接受的参数形式。
 func FormatReplaceArg(rep ReplaceItem) string {
-	oldSpec := rep.Old.Path
-	if rep.Old.Version != "" {
-		oldSpec += "@" + rep.Old.Version
-	}
+	oldSpec := FormatDropReplaceArg(rep)
 	newSpec := rep.New.Path
 	if rep.New.Version != "" {
 		newSpec += "@" + rep.New.Version
 	}
 	return oldSpec + "=" + newSpec
+}
+
+// FormatDropReplaceArg 将 ReplaceItem 格式化为 `go mod edit -dropreplace=<arg>` 接受的参数形式。
+func FormatDropReplaceArg(rep ReplaceItem) string {
+	if rep.Old.Version != "" {
+		return rep.Old.Path + "@" + rep.Old.Version
+	}
+	return rep.Old.Path
 }
 
 // ParseModFile 调用 `go mod edit -json <modFilePath>` 解析模块文件。
