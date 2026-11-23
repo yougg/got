@@ -1030,4 +1030,110 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 			t.Fatalf("got tool ftool failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 	})
+
+	t.Run("mod tidy and rm run in sandbox without scanning main project source files", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/bizapp\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		// 构造一段引用无法在 got.mod 中解析的业务代码；若 got mod tidy 扫描了项目目录必然报错
+		brokenDir := filepath.Join(proj, "pkg", "biz")
+		if err := os.MkdirAll(brokenDir, 0o755); err != nil {
+			t.Fatalf("mkdir pkg/biz: %v", err)
+		}
+		brokenSrc := "package biz\n\nimport _ \"example.com/unreachable-biz-only/subpkg\"\n"
+		if err := os.WriteFile(filepath.Join(brokenDir, "biz.go"), []byte(brokenSrc), 0o644); err != nil {
+			t.Fatalf("write pkg/biz/biz.go: %v", err)
+		}
+
+		// 同时准备一个本地相对路径 replace 模块，验证沙箱 tidy 保持相对路径 replace
+		localRepDir := filepath.Join(proj, "localrep")
+		if err := os.MkdirAll(filepath.Join(localRepDir, "cmd", "ltool"), 0o755); err != nil {
+			t.Fatalf("mkdir localrep: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localRepDir, "go.mod"), []byte("module example.com/localrep\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write localrep/go.mod: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localRepDir, "cmd", "ltool", "main.go"), []byte("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"ltool-ok\") }\n"), 0o644); err != nil {
+			t.Fatalf("write localrep main.go: %v", err)
+		}
+
+		gotModInitial := strings.Join([]string{
+			"module got.local/tools",
+			"",
+			"go 1.24",
+			"",
+			"tool (",
+			"\texample.com/probe/cmd/probetool",
+			"\texample.com/localrep/cmd/ltool",
+			")",
+			"",
+			"require (",
+			"\texample.com/biz v1.0.0 // indirect",
+			"\texample.com/localrep v0.0.0-00010101000000-000000000000 // indirect",
+			"\texample.com/probe v1.0.0 // indirect",
+			")",
+			"",
+			"replace example.com/localrep => ./localrep",
+			"",
+		}, "\n")
+		gotModPath := filepath.Join(proj, "got.mod")
+		if err := os.WriteFile(gotModPath, []byte(gotModInitial), 0o644); err != nil {
+			t.Fatalf("write got.mod: %v", err)
+		}
+
+		// -diff 只读模式存在差异时应返回非 0 退出码、打印 diff 且不修改 got.mod
+		diffOut, stderr, code := h.runGot(t, proj, nil, "mod", "tidy", "-diff")
+		if code == 0 || !strings.Contains(diffOut, "example.com/biz") {
+			t.Fatalf("got mod tidy -diff unexpected result: code=%d stdout=%q stderr=%q", code, diffOut, stderr)
+		}
+		afterDiff, err := os.ReadFile(gotModPath)
+		if err != nil {
+			t.Fatalf("read got.mod after -diff: %v", err)
+		}
+		if string(afterDiff) != gotModInitial {
+			t.Errorf("got mod tidy -diff should not modify got.mod")
+		}
+
+		// 正式执行 got mod tidy：应清理冗余 example.com/biz、保留相对路径 replace、且不扫描 pkg/biz/biz.go
+		_, stderr, code = h.runGot(t, proj, nil, "mod", "tidy")
+		if code != 0 {
+			t.Fatalf("got mod tidy failed: code=%d stderr=%q", code, stderr)
+		}
+		// tidy 完成后再次 -diff 应返回 0
+		_, stderr, code = h.runGot(t, proj, nil, "mod", "tidy", "-diff")
+		if code != 0 {
+			t.Fatalf("got mod tidy -diff after tidy failed: code=%d stderr=%q", code, stderr)
+		}
+		afterTidyBytes, err := os.ReadFile(gotModPath)
+		if err != nil {
+			t.Fatalf("read got.mod after tidy: %v", err)
+		}
+		afterTidy := string(afterTidyBytes)
+		if strings.Contains(afterTidy, "example.com/biz") || strings.Contains(afterTidy, "unreachable-biz-only") {
+			t.Errorf("unexpected business dependency in tidied got.mod:\n%s", afterTidy)
+		}
+		if !strings.Contains(afterTidy, "replace example.com/localrep => ./localrep") {
+			t.Errorf("relative replace should be preserved after tidy:\n%s", afterTidy)
+		}
+
+		// 验证相对路径 replace 工具可正常执行
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "ltool")
+		if code != 0 || strings.TrimSpace(stdout) != "ltool-ok" {
+			t.Fatalf("got tool ltool failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+
+		// 验证 got rm（内部会调用 tidy）同样不会扫描 pkg/biz/biz.go
+		_, stderr, code = h.runGot(t, proj, nil, "rm", "probetool")
+		if code != 0 {
+			t.Fatalf("got rm probetool failed: code=%d stderr=%q", code, stderr)
+		}
+		afterRmBytes, err := os.ReadFile(gotModPath)
+		if err != nil {
+			t.Fatalf("read got.mod after rm: %v", err)
+		}
+		if strings.Contains(string(afterRmBytes), "example.com/probe") {
+			t.Errorf("expected probe removed after got rm:\n%s", string(afterRmBytes))
+		}
+	})
 }

@@ -143,7 +143,7 @@ flowchart TD
 | **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u`<br>`got get -u pkg` | 1. 透传参数至 `go get -modfile=<got.mod> ...`。<br>2. 若使用 `got get -u` 且未传包参数，自动补充 `tool` 元包模式（即 `go get -modfile=<got.mod> -u tool`），防止更新范围异常。<br>3. 若当前尚未初始化 `got.mod` 且执行 `got get -tool`，可报错提示执行 `got init`（或通过 `--init` 自动初始化）。 |
 | **`got rm`**<br>(`remove`) | `got rm <tool-or-pkg>...` | 1. 支持传入短名（自动从 `got.mod` 解析对应全路径）或完整包路径。<br>2. 依次执行 `go get -modfile=<got.mod> -tool <pkg>@none` 与 `go mod tidy -modfile=<got.mod>`，一步完成移除与清理。 |
 | **`got tool`**<br>(`exe`) | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | 1. **无参数**：调用 `go tool -modfile=<got.mod>` 展示可用工具列表。<br>2. **匹配 `got.mod` 自定义工具**：<br>   - 带 `-n`：直接打印 `go tool -modfile=<got.mod> -n <target>` 的结果。<br>   - 正常执行：走“两阶段编译 + 执行”引擎，透传 `<args...>`、stdin/stdout/stderr 与系统信号。<br>3. **未匹配 `got.mod`**：视作 Go 内置工具，剥离 `-modfile` 并以用户原始环境透传 `go tool <args...>`。 |
-| **`got mod`** | `got mod tidy`<br>`got mod download`<br>`got mod verify`<br>`got mod edit ...` | 在子命令后插入 `-modfile=<got.mod>`（注意：`go mod` 要求 `-modfile` 位于子命令如 `tidy`/`edit` 之后，例如 `go mod tidy -modfile=...`）。 |
+| **`got mod`** | `got mod tidy`<br>`got mod download`<br>`got mod verify`<br>`got mod edit ...` | 在子命令后插入 `-modfile=<got.mod>`（注意：`go mod` 要求 `-modfile` 位于子命令如 `tidy`/`edit` 之后，例如 `go mod tidy -modfile=...`）。对于不含仓库本地工具的 `got mod tidy`，在独立临时沙箱目录执行并回写结果（自动保留相对路径 `replace`），避免扫描主项目业务源码文件。 |
 | **`got list`** | `got list tool`<br>`got list -m all` | 映射为 `go list -modfile=<got.mod> ...`。 |
 | **`got version`** | `got version` | 输出 `got` 自身版本、构建信息以及底层 `go env GOVERSION`。 |
 

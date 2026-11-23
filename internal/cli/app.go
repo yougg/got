@@ -614,7 +614,7 @@ func (a *App) runRemove(ctx context.Context, r *runner.Runner, workDir, gotFileE
 	}
 
 	// 第二步：执行 tidy 清理无用的间接依赖与 got.sum
-	return r.RunStreaming(ctx, loc, "mod", []string{"tidy"})
+	return r.RunModTidy(ctx, loc, nil)
 }
 
 // ToolInvocation 表示解析后的 `got tool` 调用结构。
@@ -714,6 +714,9 @@ func (a *App) runMod(ctx context.Context, r *runner.Runner, workDir, gotFileEnv 
 	loc, err := locator.Locate(workDir, gotFileEnv)
 	if err != nil {
 		return 1, err
+	}
+	if len(args) > 0 && args[0] == "tidy" {
+		return r.RunModTidy(ctx, loc, args[1:])
 	}
 	return r.RunStreaming(ctx, loc, "mod", args)
 }
