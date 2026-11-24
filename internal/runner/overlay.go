@@ -39,12 +39,23 @@ func CreateOverlay(loc *locator.Context) (flagArg string, cleanup func(), err er
 		cleanupOnErr()
 		return "", noop, fmt.Errorf("failed to create virtual go.mod file: %w", err)
 	}
+	if resolvedEmpty, evalErr := filepath.EvalSymlinks(emptyModPath); evalErr == nil {
+		emptyModPath = resolvedEmpty
+	}
 
+	replaceMap := make(map[string]string, 2)
 	virtualGoMod := filepath.Join(loc.RootDir, locator.GoModFileName)
+	replaceMap[virtualGoMod] = emptyModPath
+
+	// 当 RootDir 位于符号链接路径下（例如 macOS 的 /var -> /private/var）时，
+	// 底层 go 进程通过 os.Getwd() 看到的可能是解析符号链接后的物理路径，需一并注册到 Replace 映射中。
+	if resolvedRoot, evalErr := filepath.EvalSymlinks(loc.RootDir); evalErr == nil && resolvedRoot != "" {
+		resolvedGoMod := filepath.Join(resolvedRoot, locator.GoModFileName)
+		replaceMap[resolvedGoMod] = emptyModPath
+	}
+
 	spec := overlaySpec{
-		Replace: map[string]string{
-			virtualGoMod: emptyModPath,
-		},
+		Replace: replaceMap,
 	}
 
 	data, err := json.Marshal(spec)

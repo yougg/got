@@ -198,6 +198,15 @@ func newTestHarness(t *testing.T) *testHarness {
 	}
 }
 
+func sameRealPath(a, b string) bool {
+	ra, err1 := filepath.EvalSymlinks(a)
+	rb, err2 := filepath.EvalSymlinks(b)
+	if err1 == nil && err2 == nil {
+		return filepath.Clean(ra) == filepath.Clean(rb)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
 func (h *testHarness) runGot(t *testing.T, dir string, extraEnv []string, args ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
 
@@ -357,8 +366,8 @@ func TestE2E_StandardSingleModule(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
 		t.Fatalf("unmarshal report %q: %v", stdout, err)
 	}
-	if rep.Version != "v1.0.0" || rep.Cwd != proj {
-		t.Errorf("unexpected report: %+v", rep)
+	if rep.Version != "v1.0.0" || !sameRealPath(rep.Cwd, proj) {
+		t.Errorf("unexpected report: %+v (want cwd=%q)", rep, proj)
 	}
 	if len(rep.Args) != 2 || rep.Args[0] != "hello" || rep.Args[1] != "world" {
 		t.Errorf("unexpected args: %v", rep.Args)
@@ -455,7 +464,7 @@ func TestE2E_WorkspaceGoWorkPreserved(t *testing.T) {
 	if rep.GoEnvWork != goWorkPath {
 		t.Errorf("child process `go env GOWORK` = %q, want %q", rep.GoEnvWork, goWorkPath)
 	}
-	if rep.Cwd != modA {
+	if !sameRealPath(rep.Cwd, modA) {
 		t.Errorf("child process Cwd = %q, want %q", rep.Cwd, modA)
 	}
 }
@@ -564,8 +573,15 @@ func TestE2E_GoGenerateSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected generated file at %s: %v", generatedPath, err)
 	}
-	if !strings.Contains(string(data), "cwd="+subPkg) {
-		t.Errorf("generated file has unexpected cwd content:\n%s", string(data))
+	var gotCwd string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if val, ok := strings.CutPrefix(strings.TrimSpace(line), "cwd="); ok {
+			gotCwd = val
+			break
+		}
+	}
+	if !sameRealPath(gotCwd, subPkg) {
+		t.Errorf("generated file has unexpected cwd %q (want %q):\n%s", gotCwd, subPkg, string(data))
 	}
 }
 
@@ -753,7 +769,7 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
 			t.Fatalf("unmarshal report: %v", err)
 		}
-		if rep.Cwd != proj {
+		if !sameRealPath(rep.Cwd, proj) {
 			t.Errorf("Cwd with -C = %q, want %q", rep.Cwd, proj)
 		}
 
@@ -766,7 +782,7 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
 			t.Fatalf("unmarshal report: %v", err)
 		}
-		if rep.Cwd != other {
+		if !sameRealPath(rep.Cwd, other) {
 			t.Errorf("Cwd with GOTFILE = %q, want %q", rep.Cwd, other)
 		}
 	})
@@ -801,8 +817,8 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
 			t.Fatalf("unmarshal report %q: %v", stdout, err)
 		}
-		if rep.Version != "v1.0.0" || rep.Cwd != proj || len(rep.Args) != 2 || rep.Args[0] != "foo" || rep.Args[1] != "bar" {
-			t.Errorf("unexpected report from got exe: %+v", rep)
+		if rep.Version != "v1.0.0" || !sameRealPath(rep.Cwd, proj) || len(rep.Args) != 2 || rep.Args[0] != "foo" || rep.Args[1] != "bar" {
+			t.Errorf("unexpected report from got exe: %+v (want cwd=%q)", rep, proj)
 		}
 
 		// got exe 透传 Go 内置工具
@@ -1189,6 +1205,36 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		}
 		if strings.Contains(string(afterRmBytes), "example.com/probe") {
 			t.Errorf("expected probe removed after got rm:\n%s", string(afterRmBytes))
+		}
+	})
+
+	t.Run("symlink directory without go.mod works with -C overlay", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink creation requires elevated privileges on Windows")
+		}
+		realProj := t.TempDir()
+		linkParent := t.TempDir()
+		linkProj := filepath.Join(linkParent, "proj-link")
+		if err := os.Symlink(realProj, linkProj); err != nil {
+			t.Fatalf("create symlink: %v", err)
+		}
+		other := t.TempDir()
+
+		_, stderr, code := h.runGot(t, other, nil, "-C", linkProj, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		if code != 0 {
+			t.Fatalf("got -C symlink get failed: code=%d stderr=%q", code, stderr)
+		}
+
+		stdout, stderr, code := h.runGot(t, other, nil, "exe", "-C", linkProj, "probetool")
+		if code != 0 {
+			t.Fatalf("got exe -C symlink probetool failed: code=%d stderr=%q", code, stderr)
+		}
+		var rep probeReport
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rep); err != nil {
+			t.Fatalf("unmarshal report %q: %v", stdout, err)
+		}
+		if rep.Version != "v1.0.0" || !sameRealPath(rep.Cwd, linkProj) {
+			t.Errorf("unexpected report from symlink dir: %+v (want cwd=%q)", rep, linkProj)
 		}
 	})
 }
