@@ -139,7 +139,7 @@ flowchart TD
 
 | 命令 | 语法示例 | 底层映射与处理逻辑 |
 | :--- | :--- | :--- |
-| **`got init`** | `got init [module-path]`<br>`got init --same-module` | 1. 若当前目录已存在 `got.mod` 则报错退出。<br>2. 默认生成 `module got.local/tools` 与当前 Go 版本号（`go X.Y`）。<br>3. 指定 `--same-module` 时读取同级 `go.mod` 的模块路径写入 `got.mod`，用于支持调用仓库本地 `cmd/` 下的内部工具。<br>4. 若同级 `go.mod` 中已声明 `tool` 列表，自动复制到 `got.mod` 并按对应版本拉取依赖包完成初始化（包含本地工具时自动复用主模块路径）。 |
+| **`got init`** | `got init [module-path]` | 1. 若当前目录已存在 `got.mod` 则报错退出。<br>2. 若显式传入 `module-path`，则使用指定模块路径；否则若同级存在 `go.mod`，默认使用与原 `go.mod` 相同的模块路径；若当前无 `go.mod` 且未指定模块路径，则使用默认值 `got.local/tools` 与当前 Go 版本号（`go X.Y`）。<br>3. 若同级 `go.mod` 中已声明 `tool` 列表，自动复制到 `got.mod` 并按对应版本与关联 `replace` 拉取依赖包完成初始化。 |
 | **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u`<br>`got get -u pkg` | 1. 透传参数至 `go get -modfile=<got.mod> ...`。<br>2. 若使用 `got get -u` 且未传包参数，自动补充 `tool` 元包模式（即 `go get -modfile=<got.mod> -u tool`），防止更新范围异常。<br>3. 若当前尚未初始化 `got.mod` 且执行 `got get -tool`，可报错提示执行 `got init`（或通过 `--init` 自动初始化）。 |
 | **`got rm`**<br>(`remove`) | `got rm <tool-or-pkg>...` | 1. 支持传入短名（自动从 `got.mod` 解析对应全路径）或完整包路径。<br>2. 依次执行 `go get -modfile=<got.mod> -tool <pkg>@none` 与 `go mod tidy -modfile=<got.mod>`，一步完成移除与清理。 |
 | **`got tool`**<br>(`exe`) | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | 1. **无参数**：调用 `go tool -modfile=<got.mod>` 展示可用工具列表。<br>2. **匹配 `got.mod` 自定义工具**：<br>   - 带 `-n`：直接打印 `go tool -modfile=<got.mod> -n <target>` 的结果。<br>   - 正常执行：走“两阶段编译 + 执行”引擎，透传 `<args...>`、stdin/stdout/stderr 与系统信号。<br>3. **未匹配 `got.mod`**：视作 Go 内置工具，剥离 `-modfile` 并以用户原始环境透传 `go tool <args...>`。 |
@@ -252,7 +252,7 @@ type Context struct {
 
 ### 6.2 仓库内部本地工具支持
 若团队需要用 `got` 管理并运行本仓库源码自带的工具包（如 `./cmd/codegen`）：
-* 初始化时使用 `got init --same-module`，使 `got.mod` 中的 `module` 行与主项目 `go.mod` 一致。
+* 初始化时直接执行 `got init`，`got.mod` 中的 `module` 行默认与主项目 `go.mod` 一致。
 * 执行 `got mod edit -tool <main-module>/cmd/codegen` 并执行 `got mod tidy`。
 * 此时 `got tool codegen` 可直接编译运行仓库内的最新源码。
 

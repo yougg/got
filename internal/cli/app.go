@@ -162,15 +162,12 @@ func ParseGlobalFlags(args []string) (chDir string, rest []string, err error) {
 }
 
 func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv string, envInfo *gomod.EnvInfo, args []string) (int, error) {
-	sameModule := false
 	var positional []string
 
 	for _, arg := range args {
 		switch arg {
-		case "--same-module", "-same-module":
-			sameModule = true
 		case "-h", "--help":
-			fmt.Fprintln(a.Stdout, "Usage: got init [--same-module | module-path]")
+			fmt.Fprintln(a.Stdout, "Usage: got init [module-path]")
 			return 0, nil
 		default:
 			if strings.HasPrefix(arg, "-") {
@@ -180,9 +177,6 @@ func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv
 		}
 	}
 
-	if sameModule && len(positional) > 0 {
-		return 2, fmt.Errorf("cannot specify both --same-module and an explicit module path")
-	}
 	if len(positional) > 1 {
 		return 2, fmt.Errorf("got init accepts at most one module path argument")
 	}
@@ -196,23 +190,9 @@ func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv
 		}
 	}
 
-	// 若同级存在 go.mod，预先解析以便 --same-module 及自动迁移其中的 tool 列表
+	// 若同级存在 go.mod，预先解析以默认复用原 module 路径并自动迁移其中的 tool 列表
 	rootDir := filepath.Dir(targetPath)
-	mainGoMod := filepath.Join(rootDir, locator.GoModFileName)
-	var mainMod *gomod.ModEditJSON
-	if info, statErr := os.Stat(mainGoMod); statErr == nil && !info.IsDir() {
-		parsed, parseErr := gomod.ParseModFile(ctx, mainGoMod)
-		if parseErr != nil {
-			if sameModule {
-				return 1, fmt.Errorf("failed to read main module path from %s: %w", mainGoMod, parseErr)
-			}
-			slog.Debug("解析同级 go.mod 失败，跳过自动迁移 tool 列表", "path", mainGoMod, "err", parseErr)
-		} else {
-			mainMod = parsed
-		}
-	} else if sameModule {
-		return 1, fmt.Errorf("--same-module requires %s to exist: %w", mainGoMod, statErr)
-	}
+	mainMod := parseSiblingGoMod(ctx, rootDir)
 
 	var localTools []string
 	var externalTools []string
@@ -235,15 +215,9 @@ func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv
 
 	var modulePath string
 	switch {
-	case sameModule:
-		if mainMod == nil || mainMod.Module.Path == "" {
-			return 1, fmt.Errorf("main module path in %s is empty", mainGoMod)
-		}
-		modulePath = mainMod.Module.Path
 	case len(positional) == 1:
 		modulePath = positional[0]
-	case len(localTools) > 0 && mainMod != nil && mainMod.Module.Path != "":
-		// 存在仓库本地工具时，自动与主模块路径保持一致以便 Go 解析本地工具包
+	case mainMod != nil && mainMod.Module.Path != "":
 		modulePath = mainMod.Module.Path
 	default:
 		modulePath = DefaultToolModulePath
@@ -468,6 +442,20 @@ func createGotMod(targetPath, modulePath, goVersion string) error {
 	return nil
 }
 
+func parseSiblingGoMod(ctx context.Context, rootDir string) *gomod.ModEditJSON {
+	mainGoMod := filepath.Join(rootDir, locator.GoModFileName)
+	info, statErr := os.Stat(mainGoMod)
+	if statErr != nil || info.IsDir() {
+		return nil
+	}
+	parsed, parseErr := gomod.ParseModFile(ctx, mainGoMod)
+	if parseErr != nil {
+		slog.Debug("解析同级 go.mod 失败，将使用默认模块路径", "path", mainGoMod, "err", parseErr)
+		return nil
+	}
+	return parsed
+}
+
 func (a *App) runGet(ctx context.Context, r *runner.Runner, workDir, gotFileEnv string, envInfo *gomod.EnvInfo, args []string) (int, error) {
 	autoInit, cleanedArgs := ExtractInitFlag(args)
 
@@ -482,10 +470,14 @@ func (a *App) runGet(ctx context.Context, r *runner.Runner, workDir, gotFileEnv 
 					targetPath = filepath.Join(workDir, gotFileEnv)
 				}
 			}
-			if initErr := createGotMod(targetPath, DefaultToolModulePath, envInfo.GoVersion); initErr != nil {
+			modulePath := DefaultToolModulePath
+			if mainMod := parseSiblingGoMod(ctx, filepath.Dir(targetPath)); mainMod != nil && mainMod.Module.Path != "" {
+				modulePath = mainMod.Module.Path
+			}
+			if initErr := createGotMod(targetPath, modulePath, envInfo.GoVersion); initErr != nil {
 				return 1, initErr
 			}
-			fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), DefaultToolModulePath)
+			fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), modulePath)
 			loc, err = locator.Locate(workDir, gotFileEnv)
 		}
 		if err != nil {
@@ -771,7 +763,7 @@ Usage:
 	got [-C <dir>] <command> [arguments]
 
 Commands:
-	init [--same-module | module-path]   initialize a new got.mod file
+	init [module-path]                   initialize a new got.mod file
 	get [--init] [-tool] [packages...]   add or update tool dependencies in got.mod
 	rm, remove <tool-or-pkg>...          remove tool dependencies and tidy got.mod
 	tool, exe [-n] [<name> [args...]]    list or run tools declared in got.mod

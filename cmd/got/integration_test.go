@@ -588,11 +588,12 @@ func TestE2E_BuiltinToolPassthrough(t *testing.T) {
 	}
 }
 
-// 场景 6：--same-module 本地工具、GOFLAGS=-mod=vendor 清洗、歧义检测、-C 与 GOTFILE。
+// 场景 6：默认复用主模块路径与本地工具、显式自定义模块路径、GOFLAGS=-mod=vendor 清洗、歧义检测、-C 与 GOTFILE。
 func TestE2E_AdvancedEdgeCases(t *testing.T) {
 	h := newTestHarness(t)
 
-	t.Run("same-module local tool", func(t *testing.T) {
+	t.Run("init module path resolution and local tool", func(t *testing.T) {
+		// 1. 存在 go.mod 且未指定 module-path 时，默认复用 go.mod 的模块路径（直接支持仓库本地工具）
 		proj := t.TempDir()
 		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/myrepo\n\ngo 1.24\n"), 0o644); err != nil {
 			t.Fatalf("write go.mod: %v", err)
@@ -605,9 +606,16 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 			t.Fatalf("write localgen: %v", err)
 		}
 
-		_, stderr, code := h.runGot(t, proj, nil, "init", "--same-module")
+		_, stderr, code := h.runGot(t, proj, nil, "init")
 		if code != 0 {
-			t.Fatalf("got init --same-module failed: code=%d stderr=%q", code, stderr)
+			t.Fatalf("got init failed: code=%d stderr=%q", code, stderr)
+		}
+		gotModBytes, err := os.ReadFile(filepath.Join(proj, "got.mod"))
+		if err != nil {
+			t.Fatalf("read got.mod: %v", err)
+		}
+		if !strings.Contains(string(gotModBytes), "module example.com/myrepo\n") {
+			t.Errorf("expected got.mod to default to sibling go.mod module path, got:\n%s", string(gotModBytes))
 		}
 		_, stderr, code = h.runGot(t, proj, nil, "mod", "edit", "-tool", "example.com/myrepo/cmd/localgen")
 		if code != 0 {
@@ -616,6 +624,37 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "localgen")
 		if code != 0 || strings.TrimSpace(stdout) != "localgen-ok" {
 			t.Fatalf("got tool localgen failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+
+		// 2. 存在 go.mod 但显式指定了不同的 module-path 时，应使用指定值
+		customProj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(customProj, "go.mod"), []byte("module example.com/origapp\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		_, stderr, code = h.runGot(t, customProj, nil, "init", "custom.local/mytools")
+		if code != 0 {
+			t.Fatalf("got init custom.local/mytools failed: code=%d stderr=%q", code, stderr)
+		}
+		customModBytes, err := os.ReadFile(filepath.Join(customProj, "got.mod"))
+		if err != nil {
+			t.Fatalf("read custom got.mod: %v", err)
+		}
+		if !strings.Contains(string(customModBytes), "module custom.local/mytools\n") {
+			t.Errorf("expected got.mod to use explicitly specified module path, got:\n%s", string(customModBytes))
+		}
+
+		// 3. 无 go.mod 且未指定 module-path 时，应使用默认值 got.local/tools
+		noGoModDir := t.TempDir()
+		_, stderr, code = h.runGot(t, noGoModDir, nil, "init")
+		if code != 0 {
+			t.Fatalf("got init in no-go.mod dir failed: code=%d stderr=%q", code, stderr)
+		}
+		defaultModBytes, err := os.ReadFile(filepath.Join(noGoModDir, "got.mod"))
+		if err != nil {
+			t.Fatalf("read default got.mod: %v", err)
+		}
+		if !strings.Contains(string(defaultModBytes), "module got.local/tools\n") {
+			t.Errorf("expected got.mod to fall back to got.local/tools, got:\n%s", string(defaultModBytes))
 		}
 	})
 
