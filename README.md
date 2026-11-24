@@ -103,7 +103,7 @@ got [-C <dir>] <command> [arguments]
 | 命令 | 示例 | 说明 |
 | :--- | :--- | :--- |
 | **`got init`** | `got init [module-path]` | 初始化 `got.mod`。指定 `module-path` 时使用指定值；未指定时默认复用同级 `go.mod` 的模块路径，当前无 `go.mod` 时使用默认值 `got.local/tools`。若同级 `go.mod` 中已存在 `tool` 列表，会自动复制到 `got.mod` 并按对应版本及关联 `replace` 拉取依赖包完成初始化。 |
-| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get --init -tool pkg@latest`<br>`got get -u` | 透传至 `go get -modfile=<got.mod>`。使用 `--init` 可在缺失 `got.mod` 时自动初始化；使用 `got get -u` 且未传包参数时自动追加 `tool` 元包模式。 |
+| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u` | 透传至 `go get -modfile=<got.mod>`。未找到 `got.mod` 时默认先自动初始化；使用 `got get -u` 且未传包参数时自动追加 `tool` 元包模式。 |
 | **`got rm`**<br>（别名 `remove`） | `got rm stringer`<br>`got rm example.com/a/cmd/gen` | 支持短名或完整包路径，依次执行 `go get -tool <pkg>@none` 与 `go mod tidy`，一步移除工具并清理依赖。 |
 | **`got tool`**<br>（别名 `exe`） | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | 无参数时列出可用工具；匹配 `got.mod` 时走两阶段编译与执行引擎（带 `-n` 仅打印缓存二进制路径）；未匹配时按 Go 内置工具原样透传 `go tool`。 |
 | **`got mod`** | `got mod tidy`<br>`got mod download`<br>`got mod verify`<br>`got mod edit ...` | 在子命令之后自动注入 `-modfile=<got.mod>`（及必要的 `-overlay`），执行对应 `go mod` 子命令。执行 `got mod tidy`（不含仓库本地工具时）会在独立临时沙箱中运行并回写，避免扫描主项目业务源码。 |
@@ -150,8 +150,8 @@ got tool codegen
 在没有 `go.mod` 的目录（如纯 `go.work` 根目录或文档/基础设施仓库）中可以直接使用：
 
 ```bash
-got get --init -tool example.com/mytool@latest
-got tool mytool
+got get -tool example.com/mytool@latest
+got exe mytool
 ```
 
 `got` 会自动在系统临时目录生成虚拟 `go.mod` 占位并通过 `-overlay` 传递给底层 `go` 命令，执行结束后立即销毁，不在项目目录留下任何多余文件。

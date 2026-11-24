@@ -57,25 +57,6 @@ func TestParseGlobalFlags(t *testing.T) {
 	}
 }
 
-func TestExtractInitFlag(t *testing.T) {
-	initFlag, rest := ExtractInitFlag([]string{"--init", "-tool", "example.com/a@v1.0.0"})
-	if !initFlag {
-		t.Error("expected autoInit=true")
-	}
-	want := []string{"-tool", "example.com/a@v1.0.0"}
-	if !slices.Equal(rest, want) {
-		t.Errorf("rest = %v, want %v", rest, want)
-	}
-
-	initFlag, rest = ExtractInitFlag([]string{"-tool", "example.com/a@v1.0.0"})
-	if initFlag {
-		t.Error("expected autoInit=false")
-	}
-	if !slices.Equal(rest, want) {
-		t.Errorf("rest = %v, want %v", rest, want)
-	}
-}
-
 func TestNormalizeGetArgs(t *testing.T) {
 	tests := []struct {
 		name string

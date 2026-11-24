@@ -103,7 +103,7 @@ got [-C <dir>] <command> [arguments]
 | Command | Examples | Behavior |
 | :--- | :--- | :--- |
 | **`got init`** | `got init [module-path]` | Creates a new `got.mod`. Uses the specified `module-path` if provided; otherwise defaults to the sibling `go.mod` module path, or falls back to `got.local/tools` when no `go.mod` exists. If a sibling `go.mod` already declares `tool` entries, `got init` automatically copies them into `got.mod` and fetches their pinned dependency versions and related `replace` rules. |
-| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get --init -tool pkg@latest`<br>`got get -u` | Delegates to `go get -modfile=<got.mod>`. `--init` auto-initializes `got.mod` if missing; `got get -u` with no package arguments automatically appends the `tool` meta-pattern. |
+| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u` | Delegates to `go get -modfile=<got.mod>`. Automatically initializes `got.mod` when missing; `got get -u` with no package arguments automatically appends the `tool` meta-pattern. |
 | **`got rm`**<br>(alias `remove`) | `got rm stringer`<br>`got rm example.com/a/cmd/gen` | Accepts short names or full import paths. Runs `go get -tool <pkg>@none` followed by `go mod tidy` to remove tools and prune dependencies in one step. |
 | **`got tool`**<br>(alias `exe`) | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | Lists tools when called with no arguments; runs tools declared in `got.mod` via the two-stage build-and-exec engine (`-n` prints the cached binary path); passes undeclared names through to native `go tool`. |
 | **`got mod`** | `got mod tidy`<br>`got mod download`<br>`got mod verify`<br>`got mod edit ...` | Injects `-modfile=<got.mod>` (and `-overlay` when needed) after the `mod` subcommand. When no local repository tools are declared, `got mod tidy` runs in an isolated temporary sandbox and writes results back so main project Go sources are never scanned. |
@@ -150,8 +150,8 @@ got tool codegen
 In directories without a `go.mod` (such as a `go.work`-only root or a non-Go repository):
 
 ```bash
-got get --init -tool example.com/mytool@latest
-got tool mytool
+got get -tool example.com/mytool@latest
+got exe mytool
 ```
 
 `got` automatically creates a temporary empty `go.mod` mapping via `-overlay` and removes the temporary directory before exiting, leaving your repository clean.

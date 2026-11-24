@@ -167,7 +167,7 @@ func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv
 	for _, arg := range args {
 		switch arg {
 		case "-h", "--help":
-			fmt.Fprintln(a.Stdout, "Usage: got init [module-path]")
+			_, _ = fmt.Fprintln(a.Stdout, "Usage: got init [module-path]")
 			return 0, nil
 		default:
 			if strings.HasPrefix(arg, "-") {
@@ -227,7 +227,7 @@ func (a *App) runInit(ctx context.Context, r *runner.Runner, workDir, gotFileEnv
 		return 1, err
 	}
 
-	fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), modulePath)
+	_, _ = fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), modulePath)
 
 	// 若主项目 go.mod 中存在 tool 列表，自动复制到 got.mod 并拉取对应版本的依赖包
 	if len(localTools) > 0 || len(externalTools) > 0 {
@@ -269,7 +269,7 @@ func (a *App) migrateToolsFromGoMod(
 	allTools = append(allTools, externalTools...)
 	allTools = append(allTools, localTools...)
 
-	fmt.Fprintf(a.Stderr, "got: migrating %d tool(s) from go.mod to %s\n", len(allTools), filepath.Base(loc.ModFile))
+	_, _ = fmt.Fprintf(a.Stderr, "got: migrating %d tool(s) from go.mod to %s\n", len(allTools), filepath.Base(loc.ModFile))
 
 	// 0. 复制与工具完整依赖图（含直接与传递依赖）相关的 replace 规则
 	var provisionalReplaces []gomod.ReplaceItem
@@ -457,27 +457,28 @@ func parseSiblingGoMod(ctx context.Context, rootDir string) *gomod.ModEditJSON {
 }
 
 func (a *App) runGet(ctx context.Context, r *runner.Runner, workDir, gotFileEnv string, envInfo *gomod.EnvInfo, args []string) (int, error) {
-	autoInit, cleanedArgs := ExtractInitFlag(args)
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "-help" || args[0] == "--help") {
+		cmd := exec.CommandContext(ctx, "go", "get", "-h")
+		cmd.Dir = workDir
+		cmd.Env = runner.BuildGoEnv(os.Environ(), r.HostOS, r.HostArch)
+		cmd.Stdin = a.Stdin
+		cmd.Stdout = a.Stdout
+		cmd.Stderr = a.Stderr
+		if err := cmd.Run(); err != nil {
+			if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+				return exitErr.ExitCode(), nil
+			}
+			return 1, fmt.Errorf("failed to run go get -h: %w", err)
+		}
+		return 0, nil
+	}
 
 	loc, err := locator.Locate(workDir, gotFileEnv)
 	if err != nil {
-		if errors.Is(err, locator.ErrModFileNotFound) && autoInit {
-			targetPath := filepath.Join(workDir, locator.DefaultModFileName)
-			if gotFileEnv != "" {
-				if filepath.IsAbs(gotFileEnv) {
-					targetPath = filepath.Clean(gotFileEnv)
-				} else {
-					targetPath = filepath.Join(workDir, gotFileEnv)
-				}
+		if errors.Is(err, locator.ErrModFileNotFound) {
+			if code, initErr := a.runInit(ctx, r, workDir, gotFileEnv, envInfo, nil); initErr != nil || code != 0 {
+				return code, initErr
 			}
-			modulePath := DefaultToolModulePath
-			if mainMod := parseSiblingGoMod(ctx, filepath.Dir(targetPath)); mainMod != nil && mainMod.Module.Path != "" {
-				modulePath = mainMod.Module.Path
-			}
-			if initErr := createGotMod(targetPath, modulePath, envInfo.GoVersion); initErr != nil {
-				return 1, initErr
-			}
-			fmt.Fprintf(a.Stderr, "got: creating new %s: module %s\n", filepath.Base(targetPath), modulePath)
 			loc, err = locator.Locate(workDir, gotFileEnv)
 		}
 		if err != nil {
@@ -485,27 +486,8 @@ func (a *App) runGet(ctx context.Context, r *runner.Runner, workDir, gotFileEnv 
 		}
 	}
 
-	finalArgs := NormalizeGetArgs(cleanedArgs)
+	finalArgs := NormalizeGetArgs(args)
 	return r.RunStreaming(ctx, loc, "get", finalArgs)
-}
-
-// ExtractInitFlag 从 `got get` 参数列表中提取并移除 got 专属的 --init / -init 标志。
-func ExtractInitFlag(args []string) (autoInit bool, remaining []string) {
-	remaining = make([]string, 0, len(args))
-	endOfFlags := false
-	for _, arg := range args {
-		if !endOfFlags && arg == "--" {
-			endOfFlags = true
-			remaining = append(remaining, arg)
-			continue
-		}
-		if !endOfFlags && (arg == "--init" || arg == "-init") {
-			autoInit = true
-			continue
-		}
-		remaining = append(remaining, arg)
-	}
-	return autoInit, remaining
 }
 
 // NormalizeGetArgs 规范化 `got get` 参数：
@@ -566,7 +548,7 @@ func (a *App) runRemove(ctx context.Context, r *runner.Runner, workDir, gotFileE
 		return 2, fmt.Errorf("usage: got rm <tool-or-pkg>...")
 	}
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprintln(a.Stdout, "Usage: got rm <tool-or-pkg>...")
+		_, _ = fmt.Fprintln(a.Stdout, "Usage: got rm <tool-or-pkg>...")
 		return 0, nil
 	}
 
@@ -749,9 +731,9 @@ func (a *App) runVersion(envInfo *gomod.EnvInfo) (int, error) {
 	}
 
 	if len(buildMeta) > 0 {
-		fmt.Fprintf(a.Stdout, "got version %s (%s) using %s\n", ver, strings.Join(buildMeta, ", "), envInfo.GoVersion)
+		_, _ = fmt.Fprintf(a.Stdout, "got version %s (%s) using %s\n", ver, strings.Join(buildMeta, ", "), envInfo.GoVersion)
 	} else {
-		fmt.Fprintf(a.Stdout, "got version %s using %s\n", ver, envInfo.GoVersion)
+		_, _ = fmt.Fprintf(a.Stdout, "got version %s using %s\n", ver, envInfo.GoVersion)
 	}
 	return 0, nil
 }
@@ -764,7 +746,7 @@ Usage:
 
 Commands:
 	init [module-path]                   initialize a new got.mod file
-	get [--init] [-tool] [packages...]   add or update tool dependencies in got.mod
+	get [-tool] [packages...]            add or update tool dependencies in got.mod
 	rm, remove <tool-or-pkg>...          remove tool dependencies and tidy got.mod
 	tool, exe [-n] [<name> [args...]]    list or run tools declared in got.mod
 	mod <subcommand> [args...]           run go mod subcommands against got.mod
@@ -776,5 +758,5 @@ Environment:
 	GOTFILE=<path>   explicitly specify path to got.mod
 	GOT_DEBUG=1      enable debug logging to stderr
 `
-	fmt.Fprint(w, usage)
+	_, _ = fmt.Fprint(w, usage)
 }

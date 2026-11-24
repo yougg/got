@@ -457,10 +457,16 @@ func TestE2E_NoGoModOverlay(t *testing.T) {
 	h := newTestHarness(t)
 	dir := t.TempDir()
 
-	// 使用 --init 一步完成初始化与工具拉取
-	_, stderr, code := h.runGot(t, dir, nil, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	// 未初始化 got.mod 时，got get 应默认自动初始化并完成工具拉取
+	_, stderr, code := h.runGot(t, dir, nil, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
 	if code != 0 {
-		t.Fatalf("got get --init failed: code=%d stderr=%q", code, stderr)
+		t.Fatalf("got get auto-init failed: code=%d stderr=%q", code, stderr)
+	}
+
+	// 已取消 --init 参数，传入应报错
+	_, _, initFlagCode := h.runGot(t, t.TempDir(), nil, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+	if initFlagCode == 0 {
+		t.Fatal("expected 'got get --init' to fail after removing --init flag")
 	}
 
 	stdout, stderr, code := h.runGot(t, dir, nil, "tool", "probetool")
@@ -723,9 +729,9 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 			t.Fatalf("mkdir other: %v", err)
 		}
 
-		_, stderr, code := h.runGot(t, other, nil, "-C", proj, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		_, stderr, code := h.runGot(t, other, nil, "-C", proj, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
 		if code != 0 {
-			t.Fatalf("got -C proj get --init failed: code=%d stderr=%q", code, stderr)
+			t.Fatalf("got -C proj get failed: code=%d stderr=%q", code, stderr)
 		}
 
 		// 从 other 目录通过 -C proj 执行，Cwd 应为 proj
@@ -759,9 +765,9 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 		proj := t.TempDir()
 		other := t.TempDir()
 
-		_, stderr, code := h.runGot(t, proj, nil, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		_, stderr, code := h.runGot(t, proj, nil, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
 		if code != 0 {
-			t.Fatalf("got get --init failed: code=%d stderr=%q", code, stderr)
+			t.Fatalf("got get failed: code=%d stderr=%q", code, stderr)
 		}
 
 		// got exe 列表模式
@@ -816,7 +822,7 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 			"GOARCH=" + targetArch,
 		}
 
-		_, stderr, code := h.runGot(t, proj, crossEnv, "get", "--init", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
+		_, stderr, code := h.runGot(t, proj, crossEnv, "get", "-tool", "example.com/probe/cmd/probetool@v1.0.0")
 		if code != 0 {
 			t.Fatalf("got get under cross-compile env failed: code=%d stderr=%q", code, stderr)
 		}

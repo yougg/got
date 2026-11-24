@@ -140,7 +140,7 @@ flowchart TD
 | 命令 | 语法示例 | 底层映射与处理逻辑 |
 | :--- | :--- | :--- |
 | **`got init`** | `got init [module-path]` | 1. 若当前目录已存在 `got.mod` 则报错退出。<br>2. 若显式传入 `module-path`，则使用指定模块路径；否则若同级存在 `go.mod`，默认使用与原 `go.mod` 相同的模块路径；若当前无 `go.mod` 且未指定模块路径，则使用默认值 `got.local/tools` 与当前 Go 版本号（`go X.Y`）。<br>3. 若同级 `go.mod` 中已声明 `tool` 列表，自动复制到 `got.mod` 并按对应版本与关联 `replace` 拉取依赖包完成初始化。 |
-| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u`<br>`got get -u pkg` | 1. 透传参数至 `go get -modfile=<got.mod> ...`。<br>2. 若使用 `got get -u` 且未传包参数，自动补充 `tool` 元包模式（即 `go get -modfile=<got.mod> -u tool`），防止更新范围异常。<br>3. 若当前尚未初始化 `got.mod` 且执行 `got get -tool`，可报错提示执行 `got init`（或通过 `--init` 自动初始化）。 |
+| **`got get`** | `got get -tool pkg@v1.2.3`<br>`got get -u`<br>`got get -u pkg` | 1. 透传参数至 `go get -modfile=<got.mod> ...`。<br>2. 若使用 `got get -u` 且未传包参数，自动补充 `tool` 元包模式（即 `go get -modfile=<got.mod> -u tool`），防止更新范围异常。<br>3. 若当前尚未初始化 `got.mod`，默认先自动执行初始化再继续拉取。 |
 | **`got rm`**<br>(`remove`) | `got rm <tool-or-pkg>...` | 1. 支持传入短名（自动从 `got.mod` 解析对应全路径）或完整包路径。<br>2. 依次执行 `go get -modfile=<got.mod> -tool <pkg>@none` 与 `go mod tidy -modfile=<got.mod>`，一步完成移除与清理。 |
 | **`got tool`**<br>(`exe`) | `got tool`<br>`got tool [-n] <name> [args...]`<br>`got exe <name> [args...]` | 1. **无参数**：调用 `go tool -modfile=<got.mod>` 展示可用工具列表。<br>2. **匹配 `got.mod` 自定义工具**：<br>   - 带 `-n`：直接打印 `go tool -modfile=<got.mod> -n <target>` 的结果。<br>   - 正常执行：走“两阶段编译 + 执行”引擎，透传 `<args...>`、stdin/stdout/stderr 与系统信号。<br>3. **未匹配 `got.mod`**：视作 Go 内置工具，剥离 `-modfile` 并以用户原始环境透传 `go tool <args...>`。 |
 | **`got mod`** | `got mod tidy`<br>`got mod download`<br>`got mod verify`<br>`got mod edit ...` | 在子命令后插入 `-modfile=<got.mod>`（注意：`go mod` 要求 `-modfile` 位于子命令如 `tidy`/`edit` 之后，例如 `go mod tidy -modfile=...`）。对于不含仓库本地工具的 `got mod tidy`，在独立临时沙箱目录执行并回写结果（自动保留相对路径 `replace`），避免扫描主项目业务源码文件。 |
@@ -261,7 +261,7 @@ type Context struct {
 | 边界场景 | 预期行为 |
 | :--- | :--- |
 | 当前 Go 版本 `< 1.24` | 启动即报错：`got requires Go 1.24 or later (found go1.xx.x)`，退出码 `1` |
-| 向上查找不到 `got.mod` | 执行 `got get` / `got mod` / `got tool <custom>` 时提示未找到 `got.mod`，建议运行 `got init` |
+| 向上查找不到 `got.mod` | 执行 `got get` 时自动初始化 `got.mod`；执行 `got mod` / `got list` / `got rm` / `got tool <custom>` 时提示未找到 `got.mod`，建议运行 `got init` |
 | `got tool <builtin>`（如 `vet`）且无 `got.mod` | 直接透传给 `go tool <builtin>` 正常运行，不强制要求项目存在 `got.mod` |
 | 多个工具同名冲突 | `got tool <shortName>` 明确列出所有冲突的完整包路径并退出，要求用户传入完整路径 |
 | `GOFLAGS` 含 `-mod=vendor` | `runner` 自动剥离 `-mod` 标志，保证工具从模块缓存正常解析与构建 |
