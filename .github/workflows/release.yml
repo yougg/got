@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Build version label (used when triggered manually)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Verify Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet and Test
+        run: |
+          go vet ./...
+          go test -v -race -count=1 ./...
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${{ inputs.version || 'dev' }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ver_clean=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          VER_CLEAN: ${{ steps.meta.outputs.ver_clean }}
+        shell: bash
+        run: |
+          PKG_NAME="got_${VER_CLEAN}_${GOOS}_${GOARCH}"
+          STAGE_DIR="dist/stage/${PKG_NAME}"
+          mkdir -p "${STAGE_DIR}" dist/packages
+
+          go build -trimpath \
+            -ldflags="-s -w -X github.com/yougg/got/internal/cli.Version=${VERSION}" \
+            -o "${STAGE_DIR}/got${EXT}" ./cmd/got
+
+          cp LICENSE README.md README.en.md "${STAGE_DIR}/"
+
+          if [[ "${ARCHIVE}" == "zip" ]]; then
+            (cd "dist/stage" && zip -r "../packages/${PKG_NAME}.zip" "${PKG_NAME}")
+          else
+            tar -C "dist/stage" -czf "dist/packages/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/packages/*
+          retention-days: 14
+
+  publish:
+    name: Checksums & GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist/release
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd dist/release
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload combined release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-all
+          path: dist/release/*
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PRERELEASE_FLAG=""
+          if [[ "${TAG}" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${TAG}" dist/release/* \
+            --title "${TAG}" \
+            --generate-notes \
+            ${PRERELEASE_FLAG}

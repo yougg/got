@@ -117,6 +117,9 @@ func newTestHarness(t *testing.T) *testHarness {
 
 	binDir := t.TempDir()
 	gotBin := filepath.Join(binDir, "got")
+	if runtime.GOOS == "windows" {
+		gotBin += ".exe"
+	}
 	buildCmd := exec.Command("go", "build", "-o", gotBin, ".")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build got binary failed: %v\n%s", err, string(out))
@@ -182,9 +185,14 @@ func newTestHarness(t *testing.T) *testHarness {
 		})
 	})
 
+	proxySlash := filepath.ToSlash(proxyDir)
+	if !strings.HasPrefix(proxySlash, "/") {
+		proxySlash = "/" + proxySlash
+	}
+
 	return &testHarness{
 		gotBin:     gotBin,
-		proxyURL:   "file://" + filepath.ToSlash(proxyDir),
+		proxyURL:   "file://" + proxySlash,
 		goModCache: goModCache,
 		goCache:    strings.TrimSpace(string(goCacheBytes)),
 	}
@@ -528,9 +536,11 @@ func TestE2E_GoGenerateSubdir(t *testing.T) {
 		if !ok {
 			continue
 		}
-		switch key {
-		case "PATH":
-			genEnv = append(genEnv, "PATH="+filepath.Dir(h.gotBin)+string(filepath.ListSeparator)+val)
+		if strings.EqualFold(key, "PATH") {
+			genEnv = append(genEnv, key+"="+filepath.Dir(h.gotBin)+string(filepath.ListSeparator)+val)
+			continue
+		}
+		switch strings.ToUpper(key) {
 		case "GOPROXY", "GOSUMDB", "GOMODCACHE", "GOCACHE", "GOWORK", "GOFLAGS", "GOTFILE", "GOOS", "GOARCH":
 			continue
 		default:
