@@ -142,7 +142,7 @@ jobs:
           path: dist/release/*
           retention-days: 14
 
-      - name: Create GitHub Release
+      - name: Create or Update GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,12 +150,25 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          ARGS=(
-            --repo "${GH_REPO}"
-            --title "${TAG}"
-            --generate-notes
-          )
-          if [[ "${TAG}" == *-* ]]; then
-            ARGS+=(--prerelease)
+          if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading assets with --clobber"
+            gh release upload "${TAG}" dist/release/* --repo "${GH_REPO}" --clobber
+            BODY="$(gh release view "${TAG}" --repo "${GH_REPO}" --json body --jq '.body')"
+            if [[ -z "${BODY//[[:space:]]/}" ]]; then
+              echo "Release ${TAG} has empty notes; generating release notes"
+              NOTES="$(gh api -X POST "repos/${GH_REPO}/releases/generate-notes" -f "tag_name=${TAG}" --jq '.body')"
+              if [[ -n "${NOTES}" ]]; then
+                printf '%s\n' "${NOTES}" | gh release edit "${TAG}" --repo "${GH_REPO}" --notes-file -
+              fi
+            fi
+          else
+            ARGS=(
+              --repo "${GH_REPO}"
+              --title "${TAG}"
+              --generate-notes
+            )
+            if [[ "${TAG}" == *-* ]]; then
+              ARGS+=(--prerelease)
+            fi
+            gh release create "${TAG}" dist/release/* "${ARGS[@]}"
           fi
-          gh release create "${TAG}" dist/release/* "${ARGS[@]}"
