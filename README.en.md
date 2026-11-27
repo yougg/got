@@ -36,7 +36,7 @@ Go 1.24 introduced the `tool` directive in `go.mod` along with `go get -tool` an
 ### Install with `go install`
 
 ```bash
-go install github.com/yougg/got/cmd/got@latest
+go install github.com/yougg/got@latest
 ```
 
 ### Build from source
@@ -44,7 +44,7 @@ go install github.com/yougg/got/cmd/got@latest
 ```bash
 git clone https://github.com/yougg/got.git
 cd got
-go install ./cmd/got
+go install .
 ```
 
 Verify installation:

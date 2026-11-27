@@ -83,7 +83,7 @@ jobs:
         run: |
           mkdir -p dist
           go build -trimpath -ldflags="-s -w -X github.com/yougg/got/internal/cli.Version=${GITHUB_SHA::12}" \
-            -o "dist/got_${GOOS}_${GOARCH}${EXT}" ./cmd/got
+            -o "dist/got_${GOOS}_${GOARCH}${EXT}" .
         shell: bash
 
       - name: Upload build artifact

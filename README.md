@@ -36,7 +36,7 @@
 ### 使用 `go install` 安装
 
 ```bash
-go install github.com/yougg/got/cmd/got@latest
+go install github.com/yougg/got@latest
 ```
 
 ### 从源码编译安装
@@ -44,7 +44,7 @@ go install github.com/yougg/got/cmd/got@latest
 ```bash
 git clone https://github.com/yougg/got.git
 cd got
-go install ./cmd/got
+go install .
 ```
 
 验证安装：

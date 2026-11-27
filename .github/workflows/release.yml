@@ -98,7 +98,7 @@ jobs:
 
           go build -trimpath \
             -ldflags="-s -w -X github.com/yougg/got/internal/cli.Version=${VERSION}" \
-            -o "${STAGE_DIR}/got${EXT}" ./cmd/got
+            -o "${STAGE_DIR}/got${EXT}" .
 
           cp LICENSE README.md README.en.md "${STAGE_DIR}/"
 

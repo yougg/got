@@ -107,12 +107,11 @@ flowchart TD
 /home/yougg/code/got/
 ├── go.mod                          # 仅依赖 Go 标准库 (go 1.24+)
 ├── DESIGN.md                       # 本技术方案实现文档
-├── cmd/
-│   └── got/
-│       └── main.go                 # CLI 入口、全局标志解析、日志初始化、退出码映射
+├── main.go                         # CLI 入口、全局标志解析、日志初始化、退出码映射
+├── integration_test.go             # 端到端集成测试
 └── internal/
     ├── cli/
-    │   └── app.go                  # 子命令路由分发 (init/get/rm/tool/mod/list/version)
+    │   └── app.go                  # 子命令路由分发 (init/get/rm/tool/exe/mod/list/version)
     ├── gomod/
     │   ├── version.go              # Go 版本检查 (>= 1.24) 与 GOROOT 信息获取
     │   └── modfile.go              # 封装 go mod edit -json 解析 tool 声明及包名匹配
@@ -120,7 +119,8 @@ flowchart TD
     │   └── locator.go              # 向上查找 got.mod、支持 -C / GOTFILE、检测 go.mod 共存状态
     ├── runner/
     │   ├── runner.go               # 底层 go 命令构造器 (GOWORK=off, -modfile, GOFLAGS 清理)
-    │   └── overlay.go              # 临时 -overlay 生成与自动销毁生命周期管理
+    │   ├── overlay.go              # 临时 -overlay 生成与自动销毁生命周期管理
+    │   └── tidy.go                 # 隔离沙箱执行 got mod tidy
     └── executor/
         └── executor.go             # 两阶段编译执行器、PATH 注入、信号转发与退出码透传
 ```
