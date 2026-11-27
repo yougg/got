@@ -33,6 +33,18 @@
 
 - **Go 版本要求**：Go 1.24 及以上。
 
+### 下载预编译二进制安装
+
+前往 [GitHub Releases](https://github.com/yougg/got/releases) 下载对应平台（`linux/amd64`、`linux/arm64`、`darwin/arm64`、`windows/amd64`）的预编译压缩包，解压后将 `got`（Windows 为 `got.exe`）放入 `PATH` 目录即可：
+
+```bash
+# 以 Linux amd64 为例（将版本号替换为实际发布版本）
+tar -xzf got_<version>_linux_amd64.tar.gz
+install -m 0755 got_<version>_linux_amd64/got /usr/local/bin/got
+```
+
+> 可配合发布页附带的 `checksums.txt`（`sha256sum -c checksums.txt`）校验文件完整性。
+
 ### 使用 `go install` 安装
 
 ```bash

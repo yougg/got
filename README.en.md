@@ -33,6 +33,18 @@ Go 1.24 introduced the `tool` directive in `go.mod` along with `go get -tool` an
 
 - **Go**: 1.24 or later.
 
+### Download prebuilt binary
+
+Download the prebuilt archive for your platform (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`) from [GitHub Releases](https://github.com/yougg/got/releases), extract it, and place `got` (`got.exe` on Windows) in a directory on your `PATH`:
+
+```bash
+# Example for Linux amd64 (replace <version> with the release version)
+tar -xzf got_<version>_linux_amd64.tar.gz
+install -m 0755 got_<version>_linux_amd64/got /usr/local/bin/got
+```
+
+> You can verify downloads against the accompanying `checksums.txt` (`sha256sum -c checksums.txt`).
+
 ### Install with `go install`
 
 ```bash
