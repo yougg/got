@@ -232,3 +232,56 @@ func TestFormatReplaceArg(t *testing.T) {
 		t.Errorf("FormatDropReplaceArg(versioned) = %q, want example.com/old@v1.0.0", drop)
 	}
 }
+
+func TestParseModBytesLax(t *testing.T) {
+	raw := []byte(`
+// header comment
+module "git.ouryun.cn/base/apione"
+
+go 1.27.4
+
+replace (
+	github.com/sqlc-dev/sqlc => git.ouryun.cn/go/sqlc 0e91d2485f3be9cbe39c7162dd0c7d9b63ee1e29 // commit hash
+	example.com/local v1.0.0 => ./local/path
+)
+
+replace example.com/single => example.com/fork main
+
+tool (
+	github.com/sqlc-dev/sqlc/cmd/sqlc // sqlc
+	mvdan.cc/gofumpt
+)
+
+tool example.com/extra/cmd/ext
+
+require example.com/foo v1.2.3
+`)
+
+	parsed := ParseModBytesLax(raw)
+	if parsed.Module.Path != "git.ouryun.cn/base/apione" {
+		t.Errorf("Module.Path = %q, want git.ouryun.cn/base/apione", parsed.Module.Path)
+	}
+	if parsed.Go != "1.27.4" {
+		t.Errorf("Go = %q, want 1.27.4", parsed.Go)
+	}
+	if len(parsed.Tool) != 3 {
+		t.Fatalf("len(Tool) = %d, want 3: %+v", len(parsed.Tool), parsed.Tool)
+	}
+	if parsed.Tool[0].Path != "github.com/sqlc-dev/sqlc/cmd/sqlc" || parsed.Tool[2].Path != "example.com/extra/cmd/ext" {
+		t.Errorf("unexpected tools: %+v", parsed.Tool)
+	}
+	if len(parsed.Replace) != 3 {
+		t.Fatalf("len(Replace) = %d, want 3: %+v", len(parsed.Replace), parsed.Replace)
+	}
+	if parsed.Replace[0].Old.Path != "github.com/sqlc-dev/sqlc" ||
+		parsed.Replace[0].New.Path != "git.ouryun.cn/go/sqlc" ||
+		parsed.Replace[0].New.Version != "0e91d2485f3be9cbe39c7162dd0c7d9b63ee1e29" {
+		t.Errorf("unexpected replace[0]: %+v", parsed.Replace[0])
+	}
+	if parsed.Replace[1].Old.Version != "v1.0.0" || parsed.Replace[1].New.Path != "./local/path" || parsed.Replace[1].New.Version != "" {
+		t.Errorf("unexpected replace[1]: %+v", parsed.Replace[1])
+	}
+	if len(parsed.Require) != 1 || parsed.Require[0].Path != "example.com/foo" || parsed.Require[0].Version != "v1.2.3" {
+		t.Errorf("unexpected require: %+v", parsed.Require)
+	}
+}

@@ -30,9 +30,16 @@ func (r *Runner) RunModTidy(ctx context.Context, loc *locator.Context, tidyArgs 
 		}
 	}
 
+	// 优先使用 go mod edit -json 精确解析；若文件中包含手工填写的 commit hash / 分支名等未规范化版本，
+	// 自动降级为宽松解析，交由后续 go mod tidy 解析并规范化为伪版本。
 	mod, err := gomod.ParseModFile(ctx, loc.ModFile)
 	if err != nil {
-		return 1, err
+		slog.Debug("严格解析 got.mod 失败，降级使用宽松解析以交由 go mod tidy 规范化版本", "modFile", loc.ModFile, "err", err)
+		laxMod, laxErr := gomod.ParseModFileLax(loc.ModFile)
+		if laxErr != nil {
+			return 1, laxErr
+		}
+		mod = laxMod
 	}
 
 	// 若 got.mod 声明了当前模块内的仓库本地工具，需要在仓库根目录上下文执行 tidy 以读取本地工具源码
@@ -214,6 +221,14 @@ func rewriteSandboxReplaces(ctx context.Context, tmpDir, tmpMod string, env []st
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// 当 got.mod 同时包含相对路径 replace 与未规范化的 commit hash / 分支版本时，
+		// go mod edit 会因版本格式校验拒绝改写；仅在临时改写阶段回退为文本级安全替换。
+		if !restore {
+			if fallbackErr := rewriteRelativeReplacesText(tmpMod, rewrites); fallbackErr == nil {
+				slog.Debug("go mod edit 重写相对路径 replace 失败，已回退为文本级替换", "err", strings.TrimSpace(stderr.String()))
+				return nil
+			}
+		}
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg != "" {
 			return fmt.Errorf("failed to rewrite relative replace in sandbox: %s: %w", errMsg, err)
@@ -221,6 +236,40 @@ func rewriteSandboxReplaces(ctx context.Context, tmpDir, tmpMod string, env []st
 		return fmt.Errorf("failed to rewrite relative replace in sandbox: %w", err)
 	}
 	return nil
+}
+
+// rewriteRelativeReplacesText 在 go mod edit 无法解析未规范化版本时，对沙箱 go.mod 中的相对本地路径 replace 做行级替换。
+func rewriteRelativeReplacesText(modPath string, rewrites []relReplaceRewrite) error {
+	data, err := os.ReadFile(modPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		beforeComment, comment, hasComment := strings.Cut(line, "//")
+		if !strings.Contains(beforeComment, "=>") {
+			continue
+		}
+		left, right, ok := strings.Cut(beforeComment, "=>")
+		if !ok {
+			continue
+		}
+		for _, rw := range rewrites {
+			if !strings.Contains(left, rw.orig.Old.Path) {
+				continue
+			}
+			replaced := strings.Replace(right, rw.orig.New.Path, rw.abs.New.Path, 1)
+			if replaced != right {
+				newLine := left + "=>" + replaced
+				if hasComment {
+					newLine += "//" + comment
+				}
+				lines[i] = newLine
+				break
+			}
+		}
+	}
+	return os.WriteFile(modPath, []byte(strings.Join(lines, "\n")), 0o600)
 }
 
 func modSumPath(modFile string) string {

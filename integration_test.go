@@ -1237,4 +1237,76 @@ func TestE2E_AdvancedEdgeCases(t *testing.T) {
 			t.Errorf("unexpected report from symlink dir: %+v (want cwd=%q)", rep, linkProj)
 		}
 	})
+
+	t.Run("mod tidy resolves non-canonical replace version in got.mod", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module example.com/app\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write go.mod: %v", err)
+		}
+		// 放置一段引用无效业务包的源码，确认沙箱 tidy 不扫描主项目业务代码
+		if err := os.WriteFile(filepath.Join(proj, "main.go"), []byte("package main\n\nimport _ \"example.com/nonexistent-biz/pkg\"\n\nfunc main() {}\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+		// 同时放置一个相对路径本地 replace 模块，验证与非规范化版本 replace 共存时也能正常 tidy
+		localRepDir := filepath.Join(proj, "localrep")
+		if err := os.MkdirAll(filepath.Join(localRepDir, "cmd", "ltool"), 0o755); err != nil {
+			t.Fatalf("mkdir localrep: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localRepDir, "go.mod"), []byte("module example.com/localrep\n\ngo 1.24\n"), 0o644); err != nil {
+			t.Fatalf("write localrep/go.mod: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(localRepDir, "cmd", "ltool", "main.go"), []byte("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"ltool-ok\") }\n"), 0o644); err != nil {
+			t.Fatalf("write localrep main.go: %v", err)
+		}
+
+		// 手动在 replace 中填写非规范版本 "latest"（类似于手填 commit hash/分支名，go mod edit -json 会报错但 go mod tidy 支持解析）
+		gotModRaw := strings.Join([]string{
+			"module example.com/app",
+			"",
+			"go 1.24",
+			"",
+			"replace (",
+			"\texample.com/origtool => example.com/forktool latest",
+			"\texample.com/origdep => example.com/forkdep v1.5.1",
+			"\texample.com/localrep => ./localrep",
+			")",
+			"",
+			"tool (",
+			"\texample.com/origtool/cmd/ftool",
+			"\texample.com/localrep/cmd/ltool",
+			")",
+			"",
+			"require (",
+			"\texample.com/localrep v0.0.0-00010101000000-000000000000 // indirect",
+			"\texample.com/origtool v0.0.0-00010101000000-000000000000 // indirect",
+			")",
+			"",
+		}, "\n")
+		gotModPath := filepath.Join(proj, "got.mod")
+		if err := os.WriteFile(gotModPath, []byte(gotModRaw), 0o644); err != nil {
+			t.Fatalf("write got.mod: %v", err)
+		}
+
+		_, stderr, code := h.runGot(t, proj, nil, "mod", "tidy")
+		if code != 0 {
+			t.Fatalf("got mod tidy with non-canonical replace version failed: code=%d stderr=%q", code, stderr)
+		}
+
+		tidiedBytes, err := os.ReadFile(gotModPath)
+		if err != nil {
+			t.Fatalf("read tidied got.mod: %v", err)
+		}
+		tidied := string(tidiedBytes)
+		if !strings.Contains(tidied, "example.com/origtool => example.com/forktool v1.2.0") {
+			t.Errorf("expected non-canonical replace version resolved to v1.2.0, got:\n%s", tidied)
+		}
+		if !strings.Contains(tidied, "example.com/localrep => ./localrep") {
+			t.Errorf("expected relative replace preserved after tidy, got:\n%s", tidied)
+		}
+
+		stdout, stderr, code := h.runGot(t, proj, nil, "tool", "ftool")
+		if code != 0 || strings.TrimSpace(stdout) != "ftool:forkdep-v1.5.1" {
+			t.Fatalf("got tool ftool after tidy failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
 }

@@ -146,6 +146,185 @@ func ParseModFile(ctx context.Context, modFilePath string) (*ModEditJSON, error)
 	return &parsed, nil
 }
 
+// ParseModFileLax 以宽松语法直接读取并解析模块清单中的 module、go、tool、require 与 replace 指令。
+// 适用于包含手工填写的 commit hash 或分支名（尚未经 go mod tidy 规范化为伪版本）的 got.mod/go.mod。
+func ParseModFileLax(modFilePath string) (*ModEditJSON, error) {
+	data, err := os.ReadFile(modFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", modFilePath, err)
+	}
+	return ParseModBytesLax(data), nil
+}
+
+// ParseModBytesLax 对模块清单字节内容执行宽松解析。
+func ParseModBytesLax(data []byte) *ModEditJSON {
+	var parsed ModEditJSON
+	block := ""
+
+	for rawLine := range strings.SplitSeq(string(data), "\n") {
+		tokens := tokenizeModLine(rawLine)
+		if len(tokens) == 0 {
+			continue
+		}
+
+		if block != "" {
+			if tokens[0] == ")" {
+				block = ""
+				continue
+			}
+			parseModBlockEntry(&parsed, block, tokens)
+			continue
+		}
+
+		kw := tokens[0]
+		rest := tokens[1:]
+		if len(rest) == 0 {
+			continue
+		}
+
+		if rest[0] == "(" {
+			switch kw {
+			case "tool", "require", "replace":
+				block = kw
+			}
+			// 兼容单行括号写法，如 `tool ( example.com/a )`
+			if len(rest) > 1 && rest[len(rest)-1] == ")" {
+				inner := rest[1 : len(rest)-1]
+				if len(inner) > 0 && block != "" {
+					parseModBlockEntry(&parsed, block, inner)
+				}
+				block = ""
+			}
+			continue
+		}
+
+		switch kw {
+		case "module":
+			parsed.Module.Path = rest[0]
+		case "go":
+			parsed.Go = rest[0]
+		case "tool", "require", "replace":
+			parseModBlockEntry(&parsed, kw, rest)
+		}
+	}
+
+	return &parsed
+}
+
+func parseModBlockEntry(parsed *ModEditJSON, kind string, tokens []string) {
+	switch kind {
+	case "tool":
+		if len(tokens) >= 1 && tokens[0] != "" {
+			parsed.Tool = append(parsed.Tool, ToolItem{Path: tokens[0]})
+		}
+	case "require":
+		if len(tokens) >= 2 {
+			parsed.Require = append(parsed.Require, RequireItem{
+				Path:    tokens[0],
+				Version: tokens[1],
+			})
+		}
+	case "replace":
+		arrowIdx := slices.Index(tokens, "=>")
+		if arrowIdx < 1 || arrowIdx+1 >= len(tokens) {
+			return
+		}
+		left := tokens[:arrowIdx]
+		right := tokens[arrowIdx+1:]
+		rep := ReplaceItem{
+			Old: ModuleVersion{Path: left[0]},
+			New: ModuleVersion{Path: right[0]},
+		}
+		if len(left) >= 2 {
+			rep.Old.Version = left[1]
+		}
+		if len(right) >= 2 {
+			rep.New.Version = right[1]
+		}
+		parsed.Replace = append(parsed.Replace, rep)
+	}
+}
+
+// tokenizeModLine 剥离行尾 `//` 注释并按 go.mod 语法切分为 token 切片（支持双引号与反引号及 `(` `)` 分隔）。
+func tokenizeModLine(line string) []string {
+	var tokens []string
+	i := 0
+	n := len(line)
+
+	for i < n {
+		// 跳过空白字符
+		for i < n && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		// 遇到注释直接结束本行
+		if line[i] == '/' && i+1 < n && line[i+1] == '/' {
+			break
+		}
+		// 独立括号 token
+		if line[i] == '(' || line[i] == ')' {
+			tokens = append(tokens, line[i:i+1])
+			i++
+			continue
+		}
+		// 双引号字符串
+		if line[i] == '"' {
+			start := i
+			i++
+			for i < n {
+				if line[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if line[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			raw := line[start:i]
+			if unq, err := strconv.Unquote(raw); err == nil {
+				tokens = append(tokens, unq)
+			} else {
+				tokens = append(tokens, strings.Trim(raw, `"`))
+			}
+			continue
+		}
+		// 反引号原始字符串
+		if line[i] == '`' {
+			start := i + 1
+			i++
+			for i < n && line[i] != '`' {
+				i++
+			}
+			tokens = append(tokens, line[start:i])
+			if i < n {
+				i++
+			}
+			continue
+		}
+
+		// 普通无引号 token
+		start := i
+		for i < n {
+			c := line[i]
+			if c == ' ' || c == '\t' || c == '\r' || c == '(' || c == ')' {
+				break
+			}
+			if c == '/' && i+1 < n && line[i+1] == '/' {
+				break
+			}
+			i++
+		}
+		if i > start {
+			tokens = append(tokens, line[start:i])
+		}
+	}
+	return tokens
+}
+
 // ToolShortName 根据 Go 官方规范从工具包路径推导默认短名。
 // 若路径末段形如主版本后缀 vN (N >= 2)，则剥离该版本段后取前一段名称。
 func ToolShortName(pkgPath string) string {
